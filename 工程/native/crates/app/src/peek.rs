@@ -1,0 +1,451 @@
+// Modified for Desktop Layout Organizer from upstream PecoFence v0.4.0.
+//! Peek (Fences "Win+Space"): every fence floats above the current windows over a dimmed
+//! backdrop until the hotkey is pressed again, Esc / a click lands on the dimmer, or another
+//! application takes the foreground.
+//!
+//! The dimmer is one plain layered window per monitor work area (solid black at ~30 % alpha,
+//! the Fluent smoke layer; the taskbar stays visible and clickable). It is activatable so it
+//! can receive Esc; fences stay `WS_EX_NOACTIVATE` as always. Its alpha fades in and out (83 ms linear, the WinUI
+//! smoke-layer / Fluent fade) as a client tween: a layered window has no compositor visual, so
+//! `App::on_frame` samples the tween and re-applies the alpha each frame.
+
+use crate::anchor;
+use crate::commands::{Command, CommandQueue, WM_APP_PEEK_FOCUSED};
+use pecofence_platform::window::{
+    self, ClassOptions, MessageHandler, Window, WindowBuilder, WindowClass, style,
+};
+use pecofence_platform::{HWND, desktop, ime, monitors, msg};
+use pecofence_render::motion::{self, Curve, Motion, Tween};
+use std::time::{Duration, Instant};
+use windows_core::Result;
+
+/// While a file drag from a fence runs, the dimmer lets the pointer through: it covers the whole
+/// monitor above every other window, so without this a drop onto another application (a browser
+/// page, a mail compose window) would land on the dimmer, which accepts nothing.
+static DRAG_CLICK_THROUGH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_drag_click_through(on: bool) {
+    DRAG_CLICK_THROUGH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The fence window clicked last in this Peek (0: none yet). The dimmer keeps the keyboard (a
+/// fence cannot be activated during the Peek, see `focus_session`), so it hands the keys a fence
+/// uses (Ctrl+C / X / V, Delete, F2, Enter, the arrows, Ctrl+A, ...) on to this one.
+static KEY_FENCE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// A click in `fence` during the Peek: the keys go there from now on.
+pub fn set_key_fence(fence: HWND) {
+    let before = KEY_FENCE.swap(fence.0 as isize, std::sync::atomic::Ordering::Relaxed);
+    if before != fence.0 as isize {
+        tracing::debug!(?fence, "peek keys go to this fence");
+    }
+}
+
+/// Sends a key message the dimmer received to the fence clicked last in this Peek, which acts on
+/// it as it does with the keyboard outside the Peek. Same UI thread: the fence reads the modifier
+/// state of this very key. False when no fence was clicked in this Peek (or it is gone).
+fn send_to_key_fence(message: u32, wparam: usize, lparam: isize) -> bool {
+    let fence =
+        HWND(KEY_FENCE.load(std::sync::atomic::Ordering::Relaxed) as *mut core::ffi::c_void);
+    if fence.0.is_null() || desktop::class_name(fence) != anchor::FENCE_CLASS {
+        tracing::debug!(
+            message,
+            wparam,
+            "peek key kept: no fence clicked in this peek"
+        );
+        return false;
+    }
+    tracing::debug!(message, wparam, ?fence, "peek key passed on to the fence");
+    window::send_message(fence, message, wparam, lparam);
+    true
+}
+
+/// Focus went from a Peek window to `other`. A fence (click inside its content), another
+/// dimmer, the rename popup, the note editor's popup (a click into a note to write in it) or
+/// the search box keeps the peek; anything else ends it.
+pub fn keeps_peek(other: HWND) -> bool {
+    if other.0.is_null() {
+        return true;
+    }
+    let cls = desktop::class_name(desktop::root_ancestor(other));
+    cls == anchor::FENCE_CLASS
+        || cls == PEEK_CLASS
+        || cls == "PecoFence.Rename"
+        || cls == crate::note_edit::NOTE_EDIT_CLASS
+        || cls == crate::peek_search::SEARCH_CLASS
+        || crate::notice::is_key_card(other)
+}
+
+/// A key that types a character (letters, digits, the number pad, punctuation): the keys an
+/// input method starts a word with. Space, Backspace, Enter and the arrows are not.
+pub(crate) fn typing_key(vk: u32) -> bool {
+    matches!(vk, 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2)
+}
+
+pub const PEEK_CLASS: &str = "PecoFence.PeekDimmer";
+const WA_INACTIVE: usize = 0;
+const VK_TAB: u32 = 0x09;
+const VK_F6: u32 = 0x75;
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
+const VK_DOWN: u32 = 0x28;
+/// 30 % black (WinUI `SmokeFillColorDefault` #4D000000), the resting alpha of the dimmer.
+const DIM_ALPHA: u8 = 0x4D;
+/// Never 0: a fully transparent layered window is not hit-tested, and the dimmer must catch
+/// the click that ends the peek even while it fades.
+const CLEAR_ALPHA: u8 = 1;
+/// Fade duration both ways (WinUI `ControlFasterAnimationDuration`, linear).
+const PEEK_FADE: Duration = motion::FASTER;
+
+pub struct PeekOverlay {
+    windows: Vec<Window>,
+    dim: bool,
+    /// Layered alpha of every dimmer window (`CLEAR_ALPHA..=DIM_ALPHA`).
+    alpha: Tween,
+    /// The fade-out is running; the app tears the overlay down when it lands.
+    closing: bool,
+    /// When the Peek began.
+    started: Instant,
+}
+
+/// Takes the keyboard on the primary dimmer so Esc works. SetForegroundWindow can block while
+/// Windows hands focus between input queues, so it runs off the UI thread. Once it completes
+/// the app restores the fence block above the activated topmost dimmer. `again`: another
+/// window has the foreground by now, so the foreground lock is passed first
+/// (`claim_foreground`), and the outcome is logged.
+fn hand_focus(dimmer: HWND, control: HWND, again: bool) {
+    let dimmer = dimmer.0 as usize;
+    let control = control.0 as usize;
+    let spawned = std::thread::Builder::new()
+        .name("pecofence-peek-focus".into())
+        .spawn(move || {
+            let h = HWND(dimmer as *mut core::ffi::c_void);
+            if again {
+                let ok = window::claim_foreground(h);
+                tracing::info!(ok, "peek took the keyboard back");
+            } else {
+                window::bring_to_front(h);
+            }
+            window::post_message(
+                HWND(control as *mut core::ffi::c_void),
+                WM_APP_PEEK_FOCUSED,
+                dimmer,
+                0,
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "peek focus thread failed to start");
+    }
+}
+
+impl PeekOverlay {
+    pub fn register_class() -> Result<WindowClass> {
+        WindowClass::register(
+            PEEK_CLASS,
+            ClassOptions {
+                double_clicks: false,
+                background: Some(0x0000_0000),
+            },
+        )
+    }
+
+    /// Creates and shows one dimmer per monitor (topmost), starting its fade-in. Fences must
+    /// be raised above them afterwards (see `DesktopAnchor::set_peek`); the caller requests a
+    /// frame while [`PeekOverlay::animating`].
+    pub fn show(
+        class: &WindowClass,
+        queue: CommandQueue,
+        control: HWND,
+        dim: bool,
+        motion: &Motion,
+    ) -> Result<Self> {
+        // Keys go to no fence until one is clicked in this Peek.
+        KEY_FENCE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut windows = Vec::new();
+        for m in monitors::enumerate() {
+            let handler: MessageHandler = {
+                let queue = queue.clone();
+                // First half of a character beyond U+FFFF (an emoji): WM_CHAR brings each
+                // UTF-16 unit on its own.
+                let high_surrogate = std::cell::Cell::new(None);
+                // The input method composes on the dimmer for the rest of this Peek (a key
+                // typed again for the search box came back here).
+                let ime_stays = std::cell::Cell::new(false);
+                Box::new(
+                    move |hwnd: HWND, message: u32, wparam: usize, lparam: isize| {
+                        match message {
+                            msg::WM_LBUTTONDOWN | msg::WM_RBUTTONDOWN | msg::WM_MBUTTONDOWN => {
+                                queue.push(Command::EndPeek("dimmer clicked"));
+                                Some(0)
+                            }
+                            // Esc ends the peek (no auto-repeats). Modifier keys must NOT: the
+                            // toggle hotkey's own Ctrl / Win / Shift arrive here as WM_KEYDOWN
+                            // before WM_HOTKEY fires, and ending the peek on them would make the
+                            // hotkey restart it instead of ending it.
+                            msg::WM_KEYDOWN
+                                if wparam as u32 == msg::VK_ESCAPE && lparam & (1 << 30) == 0 =>
+                            {
+                                queue.push(Command::EndPeek("Esc pressed"));
+                                Some(0)
+                            }
+                            // A key the input method took (the first letter of a Chinese or
+                            // Japanese word): left here, the word would be composed in the input
+                            // method's own window at the screen's corner and the box would open
+                            // only once a candidate is taken. The composition is dropped and the
+                            // key typed again: the box opens empty first and has the keyboard
+                            // when that key is read, so the word is composed at the box's caret.
+                            // A key typed again that still comes here (no box, or it did not get
+                            // the keyboard) leaves this Peek's keys to the input method, as before.
+                            msg::WM_KEYDOWN if wparam as u32 == ime::VK_PROCESSKEY => {
+                                if ime::typed_again() {
+                                    ime_stays.set(true);
+                                }
+                                let vk = ime::key_taken(hwnd, lparam);
+                                let to_box = !ime_stays.get()
+                                    && typing_key(vk)
+                                    && !window::key_down(msg::VK_CONTROL)
+                                    && !window::key_down(msg::VK_MENU)
+                                    && !crate::peek_search::is_open();
+                                if !to_box {
+                                    tracing::debug!(
+                                        typing = typing_key(vk),
+                                        stays = ime_stays.get(),
+                                        "peek key taken by the input method: left to it"
+                                    );
+                                    return send_to_key_fence(message, wparam, lparam).then_some(0);
+                                }
+                                let cancelled = ime::cancel_composition(hwnd);
+                                ime::type_again(vk, lparam);
+                                tracing::debug!(
+                                    cancelled,
+                                    "peek key taken by the input method: typed again for the search box"
+                                );
+                                queue.push(Command::PeekSearchType(String::new()));
+                                Some(0)
+                            }
+                            // The other keys work on the clicked fence's icons. Letters still
+                            // open the search box: their WM_CHAR comes to the dimmer. Before any
+                            // fence has the keys, Tab and the arrows put them into the first
+                            // fence (Shift+Tab: the last one).
+                            msg::WM_KEYDOWN if wparam as u32 != msg::VK_ESCAPE => {
+                                if send_to_key_fence(message, wparam, lparam) {
+                                    Some(0)
+                                } else if matches!(wparam as u32, VK_TAB | VK_LEFT..=VK_DOWN) {
+                                    let back =
+                                        wparam as u32 == VK_TAB && window::key_down(msg::VK_SHIFT);
+                                    tracing::info!(
+                                        key = wparam,
+                                        back,
+                                        "peek key: the keyboard goes into a fence"
+                                    );
+                                    queue.push(Command::FocusNextFence {
+                                        from: HWND(std::ptr::null_mut()),
+                                        back,
+                                    });
+                                    Some(0)
+                                } else if wparam as u32 == VK_F6 {
+                                    // To the card on screen, as F6 in a fence.
+                                    queue.push(Command::CardKeys {
+                                        from: HWND(std::ptr::null_mut()),
+                                    });
+                                    Some(0)
+                                } else {
+                                    None
+                                }
+                            }
+                            // Alt+Enter (properties), Alt+Up / Alt+Left (the folder above) and
+                            // Alt+Right (forward), the Alt keys a fence handles. Other Alt keys
+                            // stay with the dimmer.
+                            msg::WM_SYSKEYDOWN
+                                if matches!(
+                                    wparam as u32,
+                                    msg::VK_RETURN | VK_LEFT | VK_UP | VK_RIGHT
+                                ) =>
+                            {
+                                send_to_key_fence(message, wparam, lparam).then_some(0)
+                            }
+                            // The menu key and Shift+F10 (lParam -1): the clicked fence's menu.
+                            msg::WM_CONTEXTMENU if lparam as u32 == u32::MAX => {
+                                send_to_key_fence(message, wparam, lparam).then_some(0)
+                            }
+                            msg::WM_NCHITTEST
+                                if DRAG_CLICK_THROUGH
+                                    .load(std::sync::atomic::Ordering::Relaxed) =>
+                            {
+                                Some(msg::HTTRANSPARENT)
+                            }
+                            msg::WM_SETFOCUS => {
+                                tracing::debug!("peek dimmer received keyboard focus");
+                                // Taking the focus raises the dimmer to the top of the topmost
+                                // band. That can land after the fences were put above it (the
+                                // focus handoff runs on another thread), leaving the dimmer over
+                                // them so a click on a fence hits the dimmer and ends the peek.
+                                // Ask the app to put the fences back on top.
+                                window::post_message(
+                                    control,
+                                    WM_APP_PEEK_FOCUSED,
+                                    hwnd.0 as usize,
+                                    0,
+                                );
+                                None
+                            }
+                            // Typing searches the fences: the first characters open the search
+                            // box (which then takes the keyboard). A leading space does not.
+                            msg::WM_CHAR => {
+                                let unit = wparam as u16;
+                                if (0xD800..0xDC00).contains(&unit) {
+                                    high_surrogate.set(Some(unit));
+                                    return Some(0);
+                                }
+                                let units = high_surrogate.take().into_iter().chain([unit]);
+                                if let Some(Ok(ch)) = char::decode_utf16(units).last()
+                                    && !ch.is_control()
+                                    && ch != ' '
+                                {
+                                    queue.push(Command::PeekSearchType(ch.to_string()));
+                                }
+                                Some(0)
+                            }
+                            msg::WM_ACTIVATE if wparam & 0xFFFF == WA_INACTIVE => {
+                                let other = HWND(lparam as *mut core::ffi::c_void);
+                                if !keeps_peek(other) {
+                                    queue.push(Command::EndPeek("dimmer lost the focus"));
+                                }
+                                None
+                            }
+                            msg::WM_CLOSE => Some(0),
+                            _ => None,
+                        }
+                    },
+                )
+            };
+            // Work area, not bounds: the taskbar must stay visible and reachable.
+            let b = m.work_area;
+            let w = WindowBuilder::new(class)
+                .title("PecoFence peek")
+                .style(style::POPUP)
+                .ex_style(style::EX_TOOLWINDOW | style::EX_LAYERED | style::EX_TOPMOST)
+                .bounds(b.left, b.top, b.right - b.left, b.bottom - b.top)
+                .create(handler)?;
+            // Black class brush + layered alpha = the dimmer. Without dimming the window is
+            // (nearly) invisible but still catches Esc / clicks to end the peek.
+            window::set_layered_alpha(w.hwnd(), CLEAR_ALPHA);
+            w.show_no_activate();
+            windows.push(w);
+        }
+        if let Some(first) = windows.first() {
+            hand_focus(first.hwnd(), control, false);
+        }
+        // Do not let synchronous window creation consume any of the fade's timeline.
+        let now = Instant::now();
+        let alpha = if dim {
+            motion.tween(
+                CLEAR_ALPHA as f32,
+                DIM_ALPHA as f32,
+                PEEK_FADE,
+                Curve::Linear,
+                now,
+            )
+        } else {
+            Tween::at(CLEAR_ALPHA as f32, now)
+        };
+        let overlay = Self {
+            windows,
+            dim,
+            alpha,
+            closing: false,
+            started: now,
+        };
+        // Applied once synchronously so a zero-duration tween (animations off) lands at the
+        // resting alpha before the first frame is composed.
+        overlay.apply(now);
+        Ok(overlay)
+    }
+
+    /// How long ago the Peek began.
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started)
+    }
+
+    /// Takes the keyboard back on the primary dimmer (another window took the foreground).
+    pub fn take_focus(&self, control: HWND) {
+        if let Some(first) = self.windows.first() {
+            hand_focus(first.hwnd(), control, true);
+        }
+    }
+
+    pub fn hwnds(&self) -> Vec<HWND> {
+        self.windows.iter().map(|w| w.hwnd()).collect()
+    }
+
+    pub fn contains(&self, hwnd: HWND) -> bool {
+        self.windows.iter().any(|w| w.hwnd() == hwnd)
+    }
+
+    fn apply(&self, now: Instant) {
+        let a = self.alpha.value_at(now).round().clamp(1.0, 255.0) as u8;
+        for w in &self.windows {
+            window::set_layered_alpha(w.hwnd(), a);
+        }
+    }
+
+    /// Starts the fade-out (continuing from wherever a running fade-in is). Idempotent.
+    /// `fences_fade`: fences fade out too (`App::begin_peek_fade_out`), so the close takes the
+    /// fade's time also when the dimmer has nothing to fade (dimming off, or clear for a file
+    /// drag).
+    pub fn begin_close(&mut self, now: Instant, fences_fade: bool) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        if self.dim {
+            self.alpha
+                .retarget(CLEAR_ALPHA as f32, PEEK_FADE, Curve::Linear, now);
+        }
+        if fences_fade && self.alpha.is_done(now) {
+            let a = self.alpha.value_at(now);
+            self.alpha = Tween::new(a, a, PEEK_FADE, Curve::Linear, now);
+        }
+    }
+
+    /// A file drag out of a fence starts (`true`) or ends: the dimmer fades away while it runs
+    /// and back afterwards. Nothing changes during the fade-out.
+    pub fn set_dragging(&mut self, dragging: bool, now: Instant) {
+        if self.closing || !self.dim {
+            return;
+        }
+        let to = if dragging { CLEAR_ALPHA } else { DIM_ALPHA };
+        self.alpha
+            .retarget(to as f32, PEEK_FADE, Curve::Linear, now);
+    }
+
+    /// The hotkey was pressed again during the fade-out: dim again without recreating windows.
+    pub fn reopen(&mut self, now: Instant) {
+        self.closing = false;
+        if self.dim {
+            self.alpha
+                .retarget(DIM_ALPHA as f32, PEEK_FADE, Curve::Linear, now);
+        }
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    /// The fade-out has landed: the overlay can be torn down.
+    pub fn close_finished(&self, now: Instant) -> bool {
+        self.closing && self.alpha.is_done(now)
+    }
+
+    pub fn animating(&self, now: Instant) -> bool {
+        !self.alpha.is_done(now)
+    }
+
+    /// One frame: re-applies the tweened alpha. Returns true while the fade still runs.
+    pub fn on_frame(&mut self, now: Instant) -> bool {
+        self.apply(now);
+        self.animating(now)
+    }
+}

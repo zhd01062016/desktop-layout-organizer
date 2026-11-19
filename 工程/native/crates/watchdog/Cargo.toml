@@ -1,0 +1,19 @@
+# Modified for Desktop Layout Organizer from upstream PecoFence v0.4.0.
+[package]
+name = "pecofence-watchdog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop Layout Organizer watchdog: restores Windows desktop icons after an abnormal exit."
+build = "build.rs"
+
+[[bin]]
+name = "pecofence-watchdog"
+path = "src/main.rs"
+
+[dependencies]
+pecofence-core = { path = "../core" }
+pecofence-platform = { path = "../platform" }
+
+[lints]
+workspace = true

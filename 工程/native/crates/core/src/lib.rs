@@ -1,0 +1,26 @@
+//! Platform-independent core: data model, layout normalization, rule engine, persistence.
+//! This crate must never depend on Windows APIs so it can be unit-tested anywhere.
+
+pub mod brand;
+pub mod config_store;
+pub mod date_group;
+pub mod everything;
+pub mod geometry;
+pub mod hotkey;
+pub mod i18n;
+pub mod log_file;
+pub mod matcher;
+pub mod model;
+pub mod note;
+pub mod rules;
+pub mod script_output;
+pub mod smart;
+pub mod type_filter;
+pub mod updates;
+pub mod usage;
+pub mod vdesk;
+
+pub use config_store::{ConfigSaver, ConfigStore, Lint, LintLevel, LoadOutcome};
+pub use date_group::{CivilDate, DateBucket, date_bucket};
+pub use model::*;
+pub use rules::{Cond, Decision, ItemFacts, Rule, RuleSet, StrOp, Target, TypeCategory};

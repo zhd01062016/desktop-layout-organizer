@@ -1,0 +1,1717 @@
+// Modified for Desktop Layout Organizer from upstream PecoFence v0.4.0.
+//! Popup menus (tray, item, fence, details header) and their command ids.
+
+use super::*;
+use crate::layout::ICON_SIZE_PRESETS;
+
+// Tray / menu command ids.
+const CMD_TOGGLE_FENCES: u32 = 1;
+const CMD_NEW_FENCE: u32 = 2;
+const CMD_APPLY_RULES: u32 = 3;
+const CMD_SETTINGS: u32 = 4;
+const CMD_REPAIR_ICONS: u32 = 5;
+const CMD_HIDE_ICONS_AGAIN: u32 = 6;
+const CMD_FEEDBACK: u32 = 7;
+const CMD_EXIT: u32 = 9;
+const CMD_PEEK: u32 = 10;
+const CMD_WINDOWS_DESKTOP: u32 = 15;
+/// 新建便签 (tray menu; only while 小工具 is on).
+const CMD_NEW_NOTE: u32 = 16;
+/// The tray's 新建小工具 submenu: 20..=24 (see `App::new_tool_submenu`).
+const CMD_NEW_TOOL: u32 = 20;
+/// Tray 「在桌面显示文件夹」 entries: 11..=14 (see `App::show_folder_submenu`).
+const CMD_SHOW_FOLDER: u32 = 11;
+/// The tray's 新建智能栅栏…: the smart fence editor for a new fence.
+const CMD_NEW_SMART: u32 = 30;
+/// 「更新到 0.3.3」 while a newer version is known.
+const CMD_UPDATE: u32 = 31;
+/// 「恢复右键菜单里的 Windows 菜单项」, while they are off after a crash in a menu extension.
+const CMD_WINDOWS_MENU_ON: u32 = 32;
+const CMD_ITEM_OPEN: u32 = 100;
+const CMD_ITEM_LOCATION: u32 = 101;
+/// Canonical verb of Windows' 打开文件所在的位置 on a shortcut (its target's folder).
+const SHELL_VERB_TARGET_LOCATION: &str = "opencontaining";
+const CMD_ITEM_PROPERTIES: u32 = 102;
+const CMD_ITEM_TO_INBOX: u32 = 103;
+const CMD_ITEM_PORTAL: u32 = 104;
+const CMD_ITEM_RENAME: u32 = 105;
+const CMD_ITEM_DELETE: u32 = 106;
+const CMD_ITEM_EMPTY_BIN: u32 = 107;
+/// 剪切 / 复制 of our own, in a menu without Windows' part (which has them otherwise).
+const CMD_ITEM_CUT: u32 = 111;
+const CMD_ITEM_COPY: u32 = 112;
+/// 像桌面一样排列 and 栅栏选项… in the item menu of the arranged 「桌面」 fence, whose own fence
+/// menu is out of reach (its window is only the icon cells).
+const CMD_ITEM_DESKTOP_LAYOUT: u32 = 108;
+const CMD_ITEM_FENCE_OPTIONS: u32 = 109;
+/// 自由摆放 in the item menu of the arranged 「桌面」 fence, below 像桌面一样排列.
+const CMD_ITEM_FREE_PLACEMENT: u32 = 118;
+/// 以后把 .pdf 文件都放到这里: an extension rule to this fence.
+const CMD_ITEM_EXT_RULE: u32 = 110;
+const CMD_FENCE_OPEN_FOLDER: u32 = 332;
+const CMD_ITEM_MOVE_BASE: u32 = 200;
+/// Command-id range handed to Explorer's `IContextMenu`.
+const CMD_SHELL_FIRST: u32 = 0x1000;
+const CMD_SHELL_LAST: u32 = 0x6FFF;
+const CMD_FENCE_ROLL: u32 = 301;
+const CMD_FENCE_DELETE: u32 = 303;
+const CMD_FENCE_NEW: u32 = 304;
+/// 新建便签 in the fence menu (only while 小工具 is on).
+const CMD_FENCE_NEW_NOTE: u32 = 307;
+/// 编辑便签 in a note's fence menu.
+const CMD_FENCE_EDIT_NOTE: u32 = 308;
+/// 添加待办 in a note's fence menu.
+const CMD_FENCE_ADD_TODO: u32 = 309;
+/// 显示秒 in a clock's fence menu.
+const CMD_FENCE_CLOCK_SECONDS: u32 = 515;
+/// The fence menu's 新建小工具 submenu: 520..=524.
+const CMD_FENCE_NEW_TOOL: u32 = 520;
+/// The fence menu's 新建智能栅栏… (the editor for a new fence) and a smart fence's 编辑条件….
+const CMD_FENCE_NEW_SMART: u32 = 530;
+const CMD_FENCE_SMART_EDIT: u32 = 546;
+/// 筛选… / 清除筛选 in the menu of a folder fence or a smart fence.
+const CMD_FENCE_FILTER: u32 = 540;
+const CMD_FENCE_FILTER_CLEAR: u32 = 541;
+/// 把筛选存为智能栅栏 in a filtered fence's menu.
+const CMD_FENCE_SAVE_SMART: u32 = 542;
+/// A smart fence's 立即刷新, 在资源管理器中打开文件夹 and 启动 / 安装 Everything.
+const CMD_FENCE_SMART_REFRESH: u32 = 543;
+const CMD_FENCE_SMART_FOLDER: u32 = 544;
+const CMD_FENCE_SMART_EVERYTHING: u32 = 545;
+/// 脚本栅栏 in its fence menu: 立即运行, 选择脚本…, 打开脚本所在的文件夹, and 运行间隔's
+/// entries (one per `ScriptSpec::INTERVALS`).
+const CMD_FENCE_SCRIPT_RUN: u32 = 500;
+const CMD_FENCE_SCRIPT_EDIT: u32 = 509;
+const CMD_FENCE_SCRIPT_PICK: u32 = 501;
+const CMD_FENCE_SCRIPT_FOLDER: u32 = 502;
+const CMD_FENCE_SCRIPT_INTERVAL_BASE: u32 = 1900;
+/// The inbox's 为空时自动隐藏 (in place of 删除栅栏).
+const CMD_FENCE_HIDE_EMPTY: u32 = 305;
+const CMD_FENCE_DESKTOP_LAYOUT: u32 = 306;
+/// 自由摆放 in the 「桌面」 fence menu (on only while it is arranged like the desktop).
+const CMD_FENCE_FREE_PLACEMENT: u32 = 398;
+/// 小图标 … 大图标: one id per `layout::ICON_SIZE_PRESETS` entry, in its order.
+const CMD_FENCE_ICON_FIRST: u32 = 310;
+const CMD_FENCE_ICON_LAST: u32 = CMD_FENCE_ICON_FIRST + ICON_SIZE_PRESETS.len() as u32 - 1;
+const CMD_FENCE_SORT_MANUAL: u32 = 320;
+const CMD_FENCE_SORT_NAME: u32 = 321;
+const CMD_FENCE_SORT_TYPE: u32 = 322;
+const CMD_FENCE_SORT_DATE: u32 = 323;
+const CMD_FENCE_SORT_SIZE: u32 = 324;
+const CMD_FENCE_SORT_REVERSE: u32 = 325;
+const CMD_FENCE_SORT_OPENED: u32 = 326;
+const CMD_FENCE_SORT_GROUP: u32 = 327;
+const CMD_FENCE_SORT_FOLDERS_FIRST: u32 = 328;
+const CMD_FENCE_LOCK: u32 = 333;
+/// 适应内容大小: the height that shows every icon, as a double-click on the bottom edge does.
+const CMD_FENCE_FIT: u32 = 334;
+const CMD_FENCE_RENAME: u32 = 330;
+/// Opens the settings page on the 「栅栏」 tab for this fence.
+const CMD_FENCE_OPTIONS: u32 = 331;
+const CMD_FENCE_NEW_FOLDER: u32 = 340;
+const CMD_FENCE_NEW_TEXT: u32 = 341;
+const CMD_FENCE_PASTE: u32 = 342;
+const CMD_FENCE_VIEW_ICONS: u32 = 360;
+const CMD_FENCE_VIEW_LIST: u32 = 361;
+const CMD_FENCE_VIEW_DETAILS: u32 = 362;
+const CMD_TAB_NEW: u32 = 370;
+const CMD_TAB_DETACH: u32 = 371;
+const CMD_TAB_MOVE_LEFT: u32 = 372;
+const CMD_TAB_MOVE_RIGHT: u32 = 373;
+/// Details header context menu (column chooser).
+const CMD_COL_NAME: u32 = 420;
+const CMD_COL_DATE: u32 = 421;
+const CMD_COL_TYPE: u32 = 422;
+const CMD_COL_SIZE: u32 = 423;
+const CMD_COL_RESET_WIDTHS: u32 = 424;
+const CMD_PORTAL_UP: u32 = 380;
+const CMD_PORTAL_HOME: u32 = 381;
+/// Fence-menu 「在桌面显示文件夹」 entries: 390..=393.
+const CMD_FENCE_SHOW_FOLDER: u32 = 390;
+/// 在哪个虚拟桌面显示 ▸ 所有虚拟桌面, then one entry per desktop (base + Task View index).
+const CMD_FENCE_VD_ALL: u32 = 1960;
+const CMD_FENCE_VD_BASE: u32 = 1961;
+const VD_MENU_MAX: usize = 39;
+/// "合并到 ▸ <host>" entries: base + index into `host_fences()`.
+const CMD_TAB_ATTACH_BASE: u32 = 2000;
+// The open-ended BASE ranges must not swallow neighbouring fixed ids (a 400 base once
+// captured the title-colour / spacing items and merged the fence into a random host).
+const _: () = assert!(
+    CMD_TAB_ATTACH_BASE > CMD_COL_RESET_WIDTHS && CMD_TAB_ATTACH_BASE + 1000 <= CMD_SHELL_FIRST
+);
+const _: () = assert!(
+    CMD_FENCE_SCRIPT_INTERVAL_BASE + 10 < CMD_FENCE_VD_ALL
+        && CMD_FENCE_VD_BASE + VD_MENU_MAX as u32 <= CMD_TAB_ATTACH_BASE
+);
+
+/// Segoe Fluent Icons glyphs beside the tray, fence and icon menu items (`PopupMenu::icon`).
+/// Check items keep their check mark (an item bitmap would take its place), so the lock is a
+/// pair of commands like 收起 / 展开. Outline glyphs only: filled badges outweigh the rest.
+pub(super) mod glyph {
+    pub const CHEVRON_UP: char = '\u{E70E}';
+    pub const CHEVRON_DOWN: char = '\u{E70D}';
+    pub const RENAME: char = '\u{E8AC}';
+    /// Edit (a pencil): 编辑便签, 编辑脚本. In Segoe MDL2 Assets too.
+    pub const EDIT: char = '\u{E70F}';
+    /// CheckboxComposite (a ticked box): 添加待办. In Segoe MDL2 Assets too.
+    pub const TODO: char = '\u{E73A}';
+    pub const FOLDER_OPEN: char = '\u{E838}';
+    pub const UP: char = '\u{E74A}';
+    pub const HOME: char = '\u{E80F}';
+    pub const VIEW_ALL: char = '\u{E8A9}';
+    pub const SORT: char = '\u{E8CB}';
+    pub const ADD: char = '\u{E710}';
+    pub const DOCUMENT: char = '\u{E8A5}';
+    pub const PASTE: char = '\u{E77F}';
+    pub const SETTING: char = '\u{E713}';
+    pub const ADD_TO: char = '\u{ECC8}';
+    /// QuickNote: 新建便签.
+    pub const NOTE: char = '\u{E70B}';
+    /// Clock: 新建时钟.
+    pub const CLOCK: char = '\u{E121}';
+    /// Code: 新建脚本栅栏; Play: 立即运行.
+    pub const CODE: char = '\u{E943}';
+    pub const PLAY: char = '\u{E768}';
+    pub const FOLDER: char = '\u{E8B7}';
+    /// 新建智能栅栏: a magnifier, as smart fences show before their title.
+    pub const SEARCH: char = '\u{E721}';
+    /// A smart fence's 立即刷新.
+    pub const REFRESH: char = '\u{E72C}';
+    /// A smart fence's 编辑条件…: a filter.
+    pub const FILTER: char = '\u{E71C}';
+    /// Favicon: a frame with a title strip, like a fence with tabs.
+    pub const TAB: char = '\u{E737}';
+    pub const LOCK: char = '\u{E72E}';
+    /// FitPage: 适应内容大小.
+    pub const FIT: char = '\u{E9A6}';
+    pub const UNLOCK: char = '\u{E785}';
+    pub const DELETE: char = '\u{E74D}';
+    /// The icon menu's own entries: OpenInNewWindow (打开), Clear (清空回收站), Import (移动到栅栏:
+    /// an arrow into a tray), Remove (移出栅栏). All four are in Segoe MDL2 Assets too.
+    pub const OPEN: char = '\u{E8A7}';
+    pub const CLEAR: char = '\u{E894}';
+    pub const MOVE_TO: char = '\u{E8B5}';
+    pub const REMOVE: char = '\u{E738}';
+    /// Copy: 复制路径 in the menu of a Peek search result.
+    pub const COPY: char = '\u{E8C8}';
+    pub const VIEW: char = '\u{E890}';
+    /// Hide (Fluent ED1A). Segoe MDL2 Assets has no crossed-out eye, so Windows 10 shows RedEye.
+    pub fn hide() -> char {
+        if pecofence_platform::fonts::fluent_icons() {
+            '\u{ED1A}'
+        } else {
+            '\u{E7B3}'
+        }
+    }
+    pub const TASK_VIEW: char = '\u{E7C4}';
+    pub const BROOM: char = '\u{EA99}';
+    pub const MONITOR: char = '\u{E7F4}';
+    pub const REPAIR: char = '\u{E90F}';
+    pub const MESSAGE: char = '\u{E8BD}';
+    /// SignOut (F3B1). Segoe MDL2 Assets of Windows 10 1809 does not have it yet (an empty box
+    /// showed beside 退出 PecoFence, #219), so that font shows PowerButton.
+    pub fn exit() -> char {
+        if pecofence_platform::fonts::icon_font_has('\u{F3B1}') {
+            '\u{F3B1}'
+        } else {
+            '\u{E7E8}'
+        }
+    }
+
+    /// Every glyph the menus show, for the test below.
+    #[cfg(test)]
+    pub fn all() -> Vec<char> {
+        vec![
+            CHEVRON_UP,
+            CHEVRON_DOWN,
+            RENAME,
+            FOLDER_OPEN,
+            UP,
+            HOME,
+            VIEW_ALL,
+            SORT,
+            ADD,
+            DOCUMENT,
+            PASTE,
+            SETTING,
+            ADD_TO,
+            NOTE,
+            CLOCK,
+            CODE,
+            PLAY,
+            FOLDER,
+            SEARCH,
+            REFRESH,
+            FILTER,
+            TAB,
+            LOCK,
+            FIT,
+            UNLOCK,
+            DELETE,
+            OPEN,
+            CLEAR,
+            MOVE_TO,
+            REMOVE,
+            COPY,
+            VIEW,
+            hide(),
+            TASK_VIEW,
+            BROOM,
+            MONITOR,
+            REPAIR,
+            MESSAGE,
+            exit(),
+        ]
+    }
+}
+
+impl App {
+    pub(super) fn show_tray_menu(&mut self, x: i32, y: i32) {
+        let hidden = self
+            .anchor
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| a.fences_hidden());
+        let menu = PopupMenu::new();
+        // A newer version stays offered at the top until it is installed.
+        if let Some(version) = self.update_offered() {
+            // While its setup downloads the item says so and takes no click.
+            let downloading = self.update_downloading();
+            let label = if downloading {
+                pecofence_core::i18n::text("正在下载新版本…").to_string()
+            } else {
+                pecofence_core::i18n::format("更新到 {0}", &[version])
+            };
+            menu.item(CMD_UPDATE, &label, false, downloading)
+                .icon(glyph::REFRESH)
+                .separator();
+        }
+        // After a crash in a menu extension the item menus have no Windows part: the way back.
+        if self.windows_menu_off() {
+            menu.item(
+                CMD_WINDOWS_MENU_ON,
+                pecofence_core::i18n::text("恢复右键菜单里的 Windows 菜单项"),
+                false,
+                false,
+            )
+            .icon(glyph::REPAIR)
+            .separator();
+        }
+        // While 「临时显示 Windows 桌面」 is on, 「回到栅栏」 is the one way back: 「显示所有栅栏」
+        // would do the same, and 「重新隐藏桌面图标」 would leave neither fences nor icons.
+        menu.item(
+            CMD_TOGGLE_FENCES,
+            if hidden {
+                pecofence_core::i18n::text("显示所有栅栏")
+            } else {
+                pecofence_core::i18n::text("隐藏所有栅栏")
+            },
+            false,
+            self.windows_desktop,
+        )
+        .icon(if hidden { glyph::VIEW } else { glyph::hide() })
+        .item(
+            CMD_WINDOWS_DESKTOP,
+            &self.windows_desktop_menu_text(),
+            false,
+            false,
+        )
+        .icon(glyph::MONITOR)
+        .item(
+            CMD_NEW_FENCE,
+            pecofence_core::i18n::text("新建栅栏"),
+            false,
+            false,
+        )
+        .icon(glyph::ADD_TO);
+        if self.state.config.settings.tools.enabled {
+            menu.item(
+                CMD_NEW_NOTE,
+                pecofence_core::i18n::text("新建便签"),
+                false,
+                false,
+            )
+            .icon(glyph::NOTE)
+            .submenu(
+                pecofence_core::i18n::text("新建小工具"),
+                self.new_tool_submenu(CMD_NEW_TOOL),
+            )
+            .icon(glyph::CODE);
+        }
+        menu.submenu(
+            pecofence_core::i18n::text("在桌面显示文件夹"),
+            Self::show_folder_submenu(CMD_SHOW_FOLDER),
+        )
+        .icon(glyph::FOLDER)
+        .item(
+            CMD_NEW_SMART,
+            pecofence_core::i18n::text("新建智能栅栏…"),
+            false,
+            false,
+        )
+        .icon(glyph::SEARCH)
+        .item(
+            CMD_PEEK,
+            &match self.peek_hotkey {
+                Some(h) => {
+                    pecofence_core::i18n::format("速览所有栅栏\t{0}", &[peek_hotkey_label(h)])
+                }
+                None if self.state.config.settings.peek.enabled
+                    && self.state.config.settings.peek.double_ctrl =>
+                {
+                    pecofence_core::i18n::format(
+                        "速览所有栅栏\t{0}",
+                        &[pecofence_core::i18n::text("双击 Ctrl").to_string()],
+                    )
+                }
+                None => pecofence_core::i18n::text("速览所有栅栏").to_string(),
+            },
+            false,
+            false,
+        )
+        .icon(glyph::TASK_VIEW)
+        .item(
+            CMD_APPLY_RULES,
+            pecofence_core::i18n::text("立即应用整理规则"),
+            false,
+            false,
+        )
+        .icon(glyph::BROOM);
+        // Autostart and monitor swapping live on the settings page; the icon repair stays as
+        // the rescue path when the desktop is left without icons.
+        menu.separator()
+            .item(
+                CMD_HIDE_ICONS_AGAIN,
+                if pecofence_platform::shell_icons::desktop_icons_hidden() {
+                    pecofence_core::i18n::text("恢复显示桌面图标")
+                } else {
+                    pecofence_core::i18n::text("重新隐藏桌面图标")
+                },
+                false,
+                self.windows_desktop,
+            )
+            .icon(glyph::MONITOR)
+            .item(
+                CMD_REPAIR_ICONS,
+                pecofence_core::i18n::text("修复桌面图标（图标消失时使用）"),
+                false,
+                false,
+            )
+            .icon(glyph::REPAIR)
+            .item(
+                CMD_FEEDBACK,
+                pecofence_core::i18n::text("发送反馈…"),
+                false,
+                false,
+            )
+            .icon(glyph::MESSAGE)
+            .item(0x70fa, "截图和贴图快捷键…", false, false)
+            .item(
+                CMD_SETTINGS,
+                pecofence_core::i18n::text("设置…"),
+                false,
+                false,
+            )
+            .icon(glyph::SETTING)
+            .separator()
+            .item(
+                CMD_EXIT,
+                pecofence_core::i18n::text("退出 PecoFence"),
+                false,
+                false,
+            )
+            .icon(glyph::exit());
+        // A sign-out while a menu is open ends the process before the menu returns, and the
+        // menu keeps TIMER_SAVE from saving meanwhile: save pending changes first.
+        self.state.save_if_dirty();
+        let owner = self.control.hwnd();
+        let cmd = self.track_menu("tray", || menu.show(owner, x, y));
+        match cmd {
+            CMD_TOGGLE_FENCES => self.toggle_all_fences("tray menu"),
+            CMD_WINDOWS_DESKTOP => self.set_windows_desktop(!self.windows_desktop, "tray menu"),
+            CMD_PEEK => self.queue.push(Command::TogglePeek),
+            CMD_NEW_FENCE => self.queue.push(Command::NewFence { x, y: y - 300 }),
+            CMD_NEW_NOTE => self.queue.push(Command::NewNote { x, y: y - 300 }),
+            c if (CMD_NEW_TOOL..CMD_NEW_TOOL + 5).contains(&c) => {
+                self.new_tool_command(c - CMD_NEW_TOOL, x, y - 300)
+            }
+            c if (CMD_SHOW_FOLDER..CMD_SHOW_FOLDER + 4).contains(&c) => {
+                self.show_folder_command(c - CMD_SHOW_FOLDER, x, y - 300, None)
+            }
+            CMD_NEW_SMART => self.queue.push(Command::OpenSmartEditor {
+                fence: None,
+                x,
+                y: y - 300,
+                by: "tray menu",
+            }),
+            CMD_APPLY_RULES => self.queue.push(Command::ApplyRulesNow),
+            CMD_UPDATE => self.update_now("tray menu"),
+            CMD_WINDOWS_MENU_ON => self.turn_windows_menu_on(),
+            CMD_REPAIR_ICONS => self.set_desktop_icons_hidden(false),
+            CMD_HIDE_ICONS_AGAIN => {
+                self.set_desktop_icons_hidden(
+                    !pecofence_platform::shell_icons::desktop_icons_hidden(),
+                );
+            }
+            CMD_FEEDBACK => self.open_feedback(false),
+            0x70fa => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe.with_file_name("FenceCapture.exe")).arg("settings").spawn();
+                }
+            }
+            CMD_SETTINGS => self.queue.push(Command::OpenSettings),
+            CMD_EXIT => self.queue.push(Command::Quit("tray menu")),
+            _ => {}
+        }
+    }
+
+    pub(super) fn show_item_menu(&mut self, fence: FenceId, items: Vec<ItemId>, x: i32, y: i32) {
+        if items.is_empty() {
+            return;
+        }
+        let (menu, shell_menu, paths) = self.build_item_menu(fence, &items);
+        let owner = self
+            .window_for(fence)
+            .map(|w| w.hwnd())
+            .unwrap_or(self.control.hwnd());
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
+        let cmd = self.track_menu("item", || menu.show_context(owner, x, y));
+        if let Some(sm) = shell_menu.as_ref()
+            && sm.contains(cmd)
+        {
+            let verb = sm.verb(cmd).unwrap_or_default();
+            tracing::info!(cmd, %verb, count = paths.len(), "shell verb invoked");
+            // Shift at the moment of choosing (Shift+click on 删除 = permanent, as in Explorer).
+            let shift = window::key_down(msg::VK_SHIFT);
+            // A dialog the verb opens (Properties, a confirmation) gives the fence the keyboard
+            // back when it closes.
+            if let Some(a) = self.anchor.borrow_mut().as_mut() {
+                a.dialog_opened_from(owner);
+            }
+            if let Err(e) = sm.invoke(cmd, owner, POINT { x, y }, shift) {
+                tracing::warn!(error = %e, %verb, "shell verb failed");
+            }
+            // Deletions / moves are picked up by the desktop watcher. What a namespace item's
+            // verb changes (Empty Recycle Bin, hide This PC) arrives as a shell notification;
+            // a resync is requested here too in case that channel is unavailable.
+            if items
+                .iter()
+                .any(|id| self.state.item(*id).is_some_and(|it| it.is_namespace()))
+            {
+                window::post_message(self.control.hwnd(), WM_APP_FS_CHANGED, 1, 0);
+            }
+            return;
+        }
+        drop(shell_menu);
+        match cmd {
+            CMD_ITEM_OPEN => {
+                // Several folders cannot all open inside the fence: Explorer gets each.
+                let inside = items.len() == 1;
+                for id in &items {
+                    self.launch(*id, fence, inside);
+                }
+            }
+            CMD_ITEM_LOCATION => {
+                if let Some(item) = items.first().and_then(|id| self.state.item(*id))
+                    && !item.is_namespace()
+                    && let Some(p) = item.path()
+                {
+                    use std::os::windows::process::CommandExt;
+                    // `/select,"<path>"`: quoted as a whole (what `arg` does for a name with
+                    // a space), the argument makes Explorer open Documents instead.
+                    let _ = std::process::Command::new("explorer.exe")
+                        .raw_arg(format!("/select,\"{p}\""))
+                        .spawn();
+                }
+            }
+            CMD_ITEM_PROPERTIES => self.show_properties(fence, &items),
+            CMD_ITEM_CUT => self.clipboard_verb(fence, &items, true),
+            CMD_ITEM_COPY => self.clipboard_verb(fence, &items, false),
+            CMD_ITEM_TO_INBOX if self.state.smart_spec(fence).is_none() => {
+                if let Some(inbox) = self.state.inbox_id() {
+                    self.move_items(&items, inbox);
+                }
+            }
+            CMD_ITEM_PORTAL => {
+                if let Some(folder) = self.single_folder_of(&items) {
+                    self.create_portal(folder, x, y, Some(fence));
+                }
+            }
+            CMD_ITEM_RENAME => {
+                if let [item] = items[..] {
+                    self.begin_item_rename(fence, item);
+                }
+            }
+            CMD_ITEM_DELETE => self.delete_items(fence, &items, window::key_down(msg::VK_SHIFT)),
+            CMD_ITEM_EMPTY_BIN => self.start_empty_recycle_bin(owner),
+            CMD_ITEM_DESKTOP_LAYOUT => {
+                self.set_fence_desktop_layout(fence, false, "item menu");
+                // An open settings page shows this switch too.
+                self.push_settings_state();
+            }
+            CMD_ITEM_FREE_PLACEMENT => {
+                let on = self.state.fence(fence).is_some_and(|f| f.free_placement);
+                self.set_fence_free_placement(fence, !on, "item menu");
+                self.push_settings_state();
+            }
+            CMD_ITEM_FENCE_OPTIONS => self.open_fence_options(fence),
+            CMD_ITEM_EXT_RULE => {
+                if let Some(ext) = self.ext_rule_offer(fence, &items) {
+                    self.add_ext_rule(fence, &ext, owner);
+                }
+            }
+            c if c >= CMD_ITEM_MOVE_BASE
+                && c < CMD_ITEM_MOVE_BASE + 1000
+                && self.state.smart_spec(fence).is_none() =>
+            {
+                let idx = (c - CMD_ITEM_MOVE_BASE) as usize;
+                if let Some(target) = self.state.fences().get(idx).map(|f| f.id) {
+                    self.move_items(&items, target);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The folder behind a single selected folder item (在桌面显示此文件夹).
+    fn single_folder_of(&self, items: &[ItemId]) -> Option<PathBuf> {
+        match items {
+            [only] => self
+                .state
+                .item(*only)
+                .filter(|it| it.is_folder)
+                .and_then(|it| it.path().map(PathBuf::from)),
+            _ => None,
+        }
+    }
+
+    /// Test dump (`--test-script item-menu`): the menu a right-click on `item` would show.
+    pub(super) fn item_menu_labels(&self, fence: FenceId, item: ItemId) -> Vec<String> {
+        self.build_item_menu(fence, &[item]).0.labels()
+    }
+
+    /// The item context menu: our commands, then Explorer's own menu for the same files.
+    fn build_item_menu(
+        &self,
+        fence: FenceId,
+        items: &[ItemId],
+    ) -> (PopupMenu, Option<ShellContextMenu>, Vec<PathBuf>) {
+        let started = Instant::now();
+        let menu = PopupMenu::new();
+        // Namespace items (Recycle Bin, ...) have no file: rename and "open location" are off.
+        let single_namespace = matches!(
+            items[..],
+            [only] if self.state.item(only).is_some_and(|it| it.is_namespace())
+        );
+        // The Recycle Bin's own 清空回收站 takes the place of the shell's: in the Store edition
+        // the shell in this process never hears of files other programs recycled, and its entry
+        // stayed grey with the bin full.
+        let single_bin = matches!(
+            items[..],
+            [only] if self
+                .state
+                .item(only)
+                .and_then(|it| it.path())
+                .is_some_and(|p| shell::is_recycle_bin_path(Path::new(p)))
+        );
+        // PecoFence's own entries have a glyph each, as in the fence menu and the tray menu.
+        menu.item(
+            CMD_ITEM_OPEN,
+            pecofence_core::i18n::text("打开\tEnter"),
+            false,
+            false,
+        )
+        .icon(glyph::OPEN)
+        .default_item(CMD_ITEM_OPEN);
+        if single_bin {
+            // A bin too big to answer quickly is taken for full.
+            let full = shell::recycle_bin_has_items_now(Duration::from_millis(200)).unwrap_or(true);
+            menu.item(
+                CMD_ITEM_EMPTY_BIN,
+                pecofence_core::i18n::text("清空回收站"),
+                false,
+                !full,
+            )
+            .icon(glyph::CLEAR);
+        }
+        menu.item(
+            CMD_ITEM_LOCATION,
+            pecofence_core::i18n::text("打开文件所在位置"),
+            false,
+            items.len() != 1 || single_namespace,
+        )
+        .icon(glyph::FOLDER_OPEN)
+        .item(
+            CMD_ITEM_RENAME,
+            pecofence_core::i18n::text("重命名\tF2"),
+            false,
+            items.len() != 1 || single_namespace,
+        )
+        .icon(glyph::RENAME)
+        .item(
+            CMD_ITEM_DELETE,
+            pecofence_core::i18n::text("删除\tDelete"),
+            false,
+            single_namespace,
+        )
+        .icon(glyph::DELETE)
+        .separator();
+        if self.single_folder_of(items).is_some() {
+            menu.item(
+                CMD_ITEM_PORTAL,
+                pecofence_core::i18n::text("在桌面显示此文件夹"),
+                false,
+                false,
+            )
+            .icon(glyph::FOLDER);
+        }
+        // A smart fence's results are files where they are: they have no fence to move to,
+        // and 移出 would move the real file to the desktop (open, rename, delete, properties
+        // and the Windows menu stay).
+        if self.state.smart_spec(fence).is_none() {
+            let inbox = self.state.inbox_id();
+            let from_portal = self.state.portal_path(fence).is_some();
+            let move_menu = PopupMenu::new();
+            let targets: Vec<(u32, String, bool)> = self
+                .state
+                .fences()
+                .iter()
+                .enumerate()
+                // A tool or smart fence holds no items; a folder fence takes the files into its
+                // folder (the index stays the fence's own).
+                .filter(|(_, f)| f.holds_items() || self.state.move_target_folder(f.id).is_some())
+                .map(|(i, f)| {
+                    let label = if self.state.move_target_folder(f.id).is_some() {
+                        pecofence_core::i18n::format(
+                            "{0}（文件会移到此文件夹）",
+                            &[self.state.display_title(f).to_string()],
+                        )
+                    } else if from_portal {
+                        pecofence_core::i18n::format(
+                            "{0}（文件会移到桌面）",
+                            std::slice::from_ref(&f.title),
+                        )
+                    } else {
+                        f.title.clone()
+                    };
+                    (CMD_ITEM_MOVE_BASE + i as u32, label, f.id == fence)
+                })
+                .collect();
+            for (id, title, disabled) in &targets {
+                move_menu.item(*id, title, false, *disabled);
+            }
+            menu.submenu(pecofence_core::i18n::text("移动到栅栏"), move_menu)
+                .icon(glyph::MOVE_TO);
+            if let Some(ext) = self.ext_rule_offer(fence, items) {
+                menu.item(
+                    CMD_ITEM_EXT_RULE,
+                    &pecofence_core::i18n::format("以后把 {0} 文件都放到这里", &[ext]),
+                    false,
+                    false,
+                )
+                .icon(glyph::BROOM);
+            }
+            menu.item(
+                CMD_ITEM_TO_INBOX,
+                if self.state.portal_path(fence).is_some() {
+                    pecofence_core::i18n::text("移出到桌面（移动文件）")
+                } else {
+                    pecofence_core::i18n::text("移出栅栏（放回“桌面”）")
+                },
+                false,
+                inbox == Some(fence),
+            )
+            .icon(glyph::REMOVE);
+        }
+        if self
+            .window_for(fence)
+            .is_some_and(|w| w.is_desktop_arranged())
+        {
+            menu.separator()
+                .item(
+                    CMD_ITEM_DESKTOP_LAYOUT,
+                    pecofence_core::i18n::text("像桌面一样排列"),
+                    true,
+                    false,
+                )
+                .item(
+                    CMD_ITEM_FREE_PLACEMENT,
+                    pecofence_core::i18n::text("自由摆放"),
+                    self.state.fence(fence).is_some_and(|f| f.free_placement),
+                    false,
+                )
+                .item(
+                    CMD_ITEM_FENCE_OPTIONS,
+                    pecofence_core::i18n::text("栅栏选项…"),
+                    false,
+                    false,
+                )
+                .icon(glyph::SETTING);
+        }
+        menu.separator();
+        // Explorer's own menu (send to / copy / delete / pin / extensions …) appended below ours.
+        let paths = self.shell_paths_of(items);
+        let _loads = pecofence_platform::shell_menu::LoadWatch::new("ItemMenu");
+        // Not after a crash in a menu extension, until the tray menu turns it back on.
+        let mut shell_menu = if self.windows_menu_off() {
+            tracing::info!("item menu: the Windows part is off");
+            None
+        } else {
+            ShellContextMenu::for_paths(&paths.iter().map(|p| p.as_path()).collect::<Vec<_>>()).ok()
+        };
+        let mut shell_items = 0;
+        if let Some(sm) = shell_menu.as_mut() {
+            let extended = window::key_down(msg::VK_SHIFT);
+            match sm.populate(
+                menu.handle(),
+                menu.len(),
+                CMD_SHELL_FIRST,
+                CMD_SHELL_LAST,
+                extended,
+            ) {
+                Ok(n) => {
+                    shell_items = n;
+                    // Explorer's own 打开 / 删除 (and 重命名 where it adds one, 清空回收站 for
+                    // the bin) duplicate ours.
+                    sm.remove_verbs(menu.handle(), &["open", "delete", "rename", "empty"]);
+                    // A shortcut gets Windows' own 打开文件所在的位置: it opens the target's
+                    // folder with the target selected, as on Explorer's desktop. Ours, under the
+                    // same name, would select the shortcut itself, so Windows' entry stays alone.
+                    let verbs = sm.verbs(menu.handle());
+                    let target_location = verbs
+                        .iter()
+                        .any(|v| v.eq_ignore_ascii_case(SHELL_VERB_TARGET_LOCATION));
+                    if target_location {
+                        menu.remove(CMD_ITEM_LOCATION);
+                    }
+                    tracing::debug!(?verbs, "item menu: shell verbs");
+                    if target_location {
+                        tracing::info!(
+                            items = items.len(),
+                            shell_ids = n,
+                            own_location = false,
+                            ms = started.elapsed().as_millis() as u64,
+                            "item menu built: Windows' open file location (shortcut target) replaces ours"
+                        );
+                    } else {
+                        tracing::info!(
+                            items = items.len(),
+                            shell_ids = n,
+                            own_location = true,
+                            ms = started.elapsed().as_millis() as u64,
+                            "item menu built"
+                        );
+                    }
+                    menu.tidy_separators();
+                }
+                Err(e) => tracing::warn!(error = %e, "shell context menu unavailable"),
+            }
+        }
+        if shell_items == 0 {
+            shell_menu = None;
+            // Windows' part has 剪切 and 复制; without it they are ours, in Explorer's place
+            // (before 属性) and by the code of Ctrl+X and Ctrl+C. Not for the Recycle Bin and
+            // the other special icons, which cannot be cut or copied.
+            let no_files = paths.iter().all(|p| shell::is_namespace_path(p));
+            menu.item(
+                CMD_ITEM_CUT,
+                pecofence_core::i18n::text("剪切\tCtrl+X"),
+                false,
+                no_files,
+            )
+            .item(
+                CMD_ITEM_COPY,
+                pecofence_core::i18n::text("复制\tCtrl+C"),
+                false,
+                no_files,
+            )
+            .separator();
+            menu.item(
+                CMD_ITEM_PROPERTIES,
+                pecofence_core::i18n::text("属性\tAlt+Enter"),
+                false,
+                false,
+            );
+        }
+        (menu, shell_menu, paths)
+    }
+
+    /// Fence background / title menu. Frequent actions only; per-fence properties (appearance,
+    /// spacing, auto height, quick-hide exclusion, dock, portal flags) live on the settings
+    /// page's 「栅栏」 tab, reached through 栅栏选项….
+    pub(super) fn show_fence_menu(&mut self, fence: FenceId, x: i32, y: i32) {
+        // `fence` may be a tab: window-level items (roll, lock) act on its host `h`, content
+        // items (view, sort, new, delete) on the fence itself.
+        let Some(f) = self.state.fence(fence).cloned() else {
+            return;
+        };
+        let host = self.state.host_of(fence);
+        let h = self.state.fence(host).cloned().unwrap_or_else(|| f.clone());
+        let menu = PopupMenu::new();
+        let rolled = self.fences.get(&host).is_some_and(|w| w.is_rolled());
+        // 像桌面一样排列 places itself: no roll, no lock.
+        let arranged = self
+            .fences
+            .get(&host)
+            .is_some_and(|w| w.is_desktop_arranged());
+        menu.item(
+            CMD_FENCE_ROLL,
+            if rolled {
+                pecofence_core::i18n::text("展开")
+            } else {
+                pecofence_core::i18n::text("收起")
+            },
+            false,
+            arranged,
+        )
+        .icon(if rolled {
+            glyph::CHEVRON_DOWN
+        } else {
+            glyph::CHEVRON_UP
+        })
+        .item(
+            CMD_FENCE_RENAME,
+            pecofence_core::i18n::text("重命名…"),
+            false,
+            false,
+        )
+        .icon(glyph::RENAME);
+        if self.filterable(fence) {
+            menu.item(
+                CMD_FENCE_FILTER,
+                pecofence_core::i18n::text("筛选…\tCtrl+F"),
+                false,
+                false,
+            )
+            .icon(glyph::SEARCH);
+            if self.fence_filter(fence).is_some() {
+                // A 任一 search of two rows or more and the filter cannot be one search: the
+                // filter would be one more 任一 row, and the fence would show far more.
+                let any_rows = f
+                    .smart
+                    .as_ref()
+                    .filter(|s| s.matching == pecofence_core::smart::SmartMatch::Any)
+                    .map_or(0, |s| s.rows());
+                let off = any_rows >= 2;
+                if off {
+                    tracing::info!(%fence, rows = any_rows, "save filter as smart fence: off for an any search of several rows");
+                }
+                menu.item(
+                    CMD_FENCE_FILTER_CLEAR,
+                    pecofence_core::i18n::text("清除筛选\tEsc"),
+                    false,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SAVE_SMART,
+                    pecofence_core::i18n::text("把筛选存为智能栅栏"),
+                    false,
+                    off,
+                )
+                .icon(glyph::SEARCH);
+                if off {
+                    menu.tip(pecofence_core::i18n::text(
+                        "这个栅栏的条件是“任一”，筛选不能存为智能栅栏。",
+                    ));
+                }
+            }
+        }
+        // 智能栅栏: change the search, run it now, see its folders, start or get Everything.
+        if let Some(spec) = f.smart.as_ref() {
+            menu.item(
+                CMD_FENCE_SMART_EDIT,
+                pecofence_core::i18n::text("编辑条件…"),
+                false,
+                false,
+            )
+            .icon(glyph::FILTER)
+            .item(
+                CMD_FENCE_SMART_REFRESH,
+                pecofence_core::i18n::text("立即刷新\tF5"),
+                false,
+                false,
+            )
+            .icon(glyph::REFRESH);
+            if !spec.folders.is_empty() {
+                menu.item(
+                    CMD_FENCE_SMART_FOLDER,
+                    pecofence_core::i18n::text("在资源管理器中打开文件夹"),
+                    false,
+                    false,
+                )
+                .icon(glyph::FOLDER_OPEN);
+            }
+            if self.smart_needs_everything(fence) {
+                menu.item(
+                    CMD_FENCE_SMART_EVERYTHING,
+                    super::smart::everything_action_label(),
+                    false,
+                    self.everything_installing,
+                );
+            }
+        }
+        let portal_dir = self.state.portal_path(fence);
+        if portal_dir.is_some() {
+            menu.item(
+                CMD_FENCE_OPEN_FOLDER,
+                pecofence_core::i18n::text("在资源管理器中打开文件夹"),
+                false,
+                false,
+            )
+            .icon(glyph::FOLDER_OPEN);
+            if self.state.can_go_up(fence) {
+                menu.item(
+                    CMD_PORTAL_UP,
+                    pecofence_core::i18n::text("返回上一级\tBackspace"),
+                    false,
+                    false,
+                )
+                .icon(glyph::UP);
+            }
+            if self.state.portal_navigated(fence) {
+                menu.item(
+                    CMD_PORTAL_HOME,
+                    pecofence_core::i18n::text("返回最初的文件夹"),
+                    false,
+                    false,
+                )
+                .icon(glyph::HOME);
+            }
+        }
+        menu.separator();
+        let tabs = self.state.tabs_of(host);
+        let tab_idx = tabs.iter().position(|t| *t == fence).unwrap_or(0);
+        // A tool fence (小工具) has no items to view, sort, create, paste or merge into tabs.
+        if f.tool == Some(pecofence_core::FenceTool::Note) {
+            menu.item(
+                CMD_FENCE_EDIT_NOTE,
+                pecofence_core::i18n::text("编辑便签"),
+                false,
+                false,
+            )
+            .icon(glyph::EDIT)
+            .item(
+                CMD_FENCE_ADD_TODO,
+                pecofence_core::i18n::text("添加待办"),
+                false,
+                false,
+            )
+            .icon(glyph::TODO);
+        } else if f.tool == Some(pecofence_core::FenceTool::Script) {
+            let spec = self.state.config.scripts.get(&fence);
+            let has_path = spec.is_some_and(|s| !s.path.is_empty());
+            let interval = spec.map_or(0, |s| s.interval_minutes);
+            let interval_menu = PopupMenu::new();
+            for (i, minutes) in pecofence_core::ScriptSpec::INTERVALS
+                .into_iter()
+                .enumerate()
+            {
+                let label = if minutes == 1 {
+                    pecofence_core::i18n::text("1 分钟").to_string()
+                } else if minutes == 60 {
+                    pecofence_core::i18n::text("1 小时").to_string()
+                } else if minutes < 60 {
+                    pecofence_core::i18n::format("{0} 分钟", &[minutes.to_string()])
+                } else {
+                    pecofence_core::i18n::format("{0} 小时", &[(minutes / 60).to_string()])
+                };
+                interval_menu.item(
+                    CMD_FENCE_SCRIPT_INTERVAL_BASE + i as u32,
+                    &label,
+                    interval == minutes,
+                    false,
+                );
+            }
+            menu.item(
+                CMD_FENCE_SCRIPT_RUN,
+                pecofence_core::i18n::text("立即运行"),
+                false,
+                !has_path,
+            )
+            .icon(glyph::PLAY)
+            .item(
+                CMD_FENCE_SCRIPT_PICK,
+                pecofence_core::i18n::text("选择脚本…"),
+                false,
+                false,
+            )
+            .icon(glyph::DOCUMENT)
+            .submenu(pecofence_core::i18n::text("运行间隔"), interval_menu)
+            .icon(glyph::CLOCK)
+            .item(
+                CMD_FENCE_SCRIPT_EDIT,
+                pecofence_core::i18n::text("编辑脚本"),
+                false,
+                !has_path,
+            )
+            .icon(glyph::EDIT)
+            .item(
+                CMD_FENCE_SCRIPT_FOLDER,
+                pecofence_core::i18n::text("打开脚本所在的文件夹"),
+                false,
+                !has_path,
+            )
+            .icon(glyph::FOLDER_OPEN);
+        } else if f.tool == Some(pecofence_core::FenceTool::Clock) {
+            // An entry with an icon shows no check mark: like 锁定位置和大小, it names what a
+            // click does now.
+            let label = if self.state.config.settings.tools.clock_seconds {
+                pecofence_core::i18n::text("不显示秒")
+            } else {
+                pecofence_core::i18n::text("显示秒")
+            };
+            menu.item(CMD_FENCE_CLOCK_SECONDS, label, false, false)
+                .icon(glyph::CLOCK);
+        } else {
+            let view_menu = PopupMenu::new();
+            view_menu
+                .item(
+                    CMD_FENCE_VIEW_ICONS,
+                    pecofence_core::i18n::text("图标"),
+                    f.view.layout == ViewLayout::Icons,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_VIEW_LIST,
+                    pecofence_core::i18n::text("列表"),
+                    f.view.layout == ViewLayout::List,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_VIEW_DETAILS,
+                    pecofence_core::i18n::text("详细信息"),
+                    f.view.layout == ViewLayout::Details,
+                    false,
+                )
+                .separator();
+            // A size between the presets (the settings slider) checks none of them.
+            let names = [
+                pecofence_core::i18n::text("小图标"),
+                pecofence_core::i18n::text("中等图标"),
+                pecofence_core::i18n::text("较大图标"),
+                pecofence_core::i18n::text("大图标"),
+            ];
+            for (cmd, (size, name)) in
+                (CMD_FENCE_ICON_FIRST..).zip(ICON_SIZE_PRESETS.into_iter().zip(names))
+            {
+                view_menu.item(cmd, name, f.view.icon_size == size, false);
+            }
+            menu.submenu(pecofence_core::i18n::text("视图"), view_menu)
+                .icon(glyph::VIEW_ALL);
+            let sort_menu = PopupMenu::new();
+            sort_menu
+                .item(
+                    CMD_FENCE_SORT_MANUAL,
+                    pecofence_core::i18n::text("手动"),
+                    f.view.sort == SortMode::Manual,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SORT_NAME,
+                    pecofence_core::i18n::text("按名称"),
+                    f.view.sort == SortMode::Name,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SORT_TYPE,
+                    pecofence_core::i18n::text("按类型"),
+                    f.view.sort == SortMode::Type,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SORT_DATE,
+                    pecofence_core::i18n::text("按修改日期"),
+                    f.view.sort == SortMode::Date,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SORT_SIZE,
+                    pecofence_core::i18n::text("按大小"),
+                    f.view.sort == SortMode::Size,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SORT_OPENED,
+                    pecofence_core::i18n::text("按打开次数"),
+                    f.view.sort == SortMode::OpenCount,
+                    false,
+                )
+                .separator()
+                .item(
+                    CMD_FENCE_SORT_REVERSE,
+                    pecofence_core::i18n::text("倒序"),
+                    f.view.reverse,
+                    false,
+                )
+                .item(
+                    CMD_FENCE_SORT_FOLDERS_FIRST,
+                    pecofence_core::i18n::text("文件夹优先"),
+                    f.view.folders_first,
+                    false,
+                )
+                .separator()
+                .item(
+                    CMD_FENCE_SORT_GROUP,
+                    pecofence_core::i18n::text("按时间分组"),
+                    f.view.group_by_date,
+                    false,
+                );
+            menu.submenu(pecofence_core::i18n::text("排序方式"), sort_menu)
+                .icon(glyph::SORT);
+            let new_menu = PopupMenu::new();
+            new_menu
+                .item(
+                    CMD_FENCE_NEW_FOLDER,
+                    pecofence_core::i18n::text("新建\x04文件夹"),
+                    false,
+                    false,
+                )
+                .icon(glyph::FOLDER)
+                .item(
+                    CMD_FENCE_NEW_TEXT,
+                    pecofence_core::i18n::text("文本文档"),
+                    false,
+                    false,
+                )
+                .icon(glyph::DOCUMENT)
+                .separator()
+                .item(
+                    CMD_TAB_NEW,
+                    pecofence_core::i18n::text("新建\x04标签页"),
+                    false,
+                    false,
+                );
+            // A smart fence shows a search: nothing is made or pasted into it.
+            if f.smart.is_none() {
+                menu.submenu(pecofence_core::i18n::text("新建"), new_menu)
+                    .icon(glyph::ADD)
+                    .item(
+                        CMD_FENCE_PASTE,
+                        pecofence_core::i18n::text("粘贴\tCtrl+V"),
+                        false,
+                        !clipboard::has_file_list(),
+                    )
+                    .icon(glyph::PASTE);
+            }
+            // Tabbed fences (Fences 6): split a tab out, move it along the strip, or merge this
+            // fence into another window. Hidden when none of that applies.
+            let other_hosts: Vec<(u32, String)> = self
+                .state
+                .host_fences()
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.id != host && o.tool.is_none())
+                // A window of another virtual desktop is not on screen to merge into.
+                .filter(|(_, o)| self.on_current_desktop(o.id))
+                .filter(|(_, o)| {
+                    !self
+                        .fences
+                        .get(&o.id)
+                        .is_some_and(|w| w.is_desktop_arranged())
+                })
+                .map(|(i, o)| (CMD_TAB_ATTACH_BASE + i as u32, o.title.clone()))
+                .collect();
+            let other_hosts = if self
+                .fences
+                .get(&host)
+                .is_some_and(|w| w.is_desktop_arranged())
+            {
+                Vec::new()
+            } else {
+                other_hosts
+            };
+            if tabs.len() >= 2 || !other_hosts.is_empty() {
+                let tab_menu = PopupMenu::new();
+                if tabs.len() >= 2 {
+                    // A left tab column moves its tabs up and down.
+                    let (earlier, later) =
+                        if self.ctx.behavior.tab_bar.get() == pecofence_core::TabBar::Left {
+                            (
+                                pecofence_core::i18n::text("上移"),
+                                pecofence_core::i18n::text("下移"),
+                            )
+                        } else {
+                            (
+                                pecofence_core::i18n::text("左移"),
+                                pecofence_core::i18n::text("右移"),
+                            )
+                        };
+                    tab_menu
+                        .item(CMD_TAB_MOVE_LEFT, earlier, false, tab_idx == 0)
+                        .item(CMD_TAB_MOVE_RIGHT, later, false, tab_idx + 1 >= tabs.len())
+                        .item(
+                            CMD_TAB_DETACH,
+                            pecofence_core::i18n::text("拆出为独立栅栏"),
+                            false,
+                            false,
+                        );
+                }
+                if !other_hosts.is_empty() {
+                    if tabs.len() >= 2 {
+                        tab_menu.separator();
+                    }
+                    let attach_menu = PopupMenu::new();
+                    for (id, title) in &other_hosts {
+                        attach_menu.item(*id, title, false, false);
+                    }
+                    tab_menu.submenu(pecofence_core::i18n::text("合并到…"), attach_menu);
+                }
+                menu.submenu(pecofence_core::i18n::text("标签页"), tab_menu)
+                    .icon(glyph::TAB);
+            }
+        }
+        // This fence's own settings, then (last) 添加到桌面 with what makes something new on
+        // the desktop, as Explorer keeps 新建 in a submenu below the object's own commands.
+        menu.separator();
+        // Fences of icons fit their height to them; nothing to fit while it is rolled, sized
+        // by 自动高度 already, locked, or placed like the desktop.
+        if f.tool.is_none() {
+            menu.item(
+                CMD_FENCE_FIT,
+                pecofence_core::i18n::text("适应内容大小"),
+                false,
+                arranged || rolled || h.locked || h.view.auto_height,
+            )
+            .icon(glyph::FIT);
+        }
+        menu.item(
+            CMD_FENCE_LOCK,
+            if h.locked {
+                pecofence_core::i18n::text("解除锁定")
+            } else {
+                pecofence_core::i18n::text("锁定位置和大小")
+            },
+            false,
+            arranged,
+        )
+        .icon(if h.locked { glyph::UNLOCK } else { glyph::LOCK });
+        // 在哪个虚拟桌面显示: offered once there is more than one virtual desktop (or the
+        // window is bound to one already). 「桌面」 shows on every desktop: new desktop items
+        // land there.
+        // A window that holds 「桌面」 as one of its tabs counts as 「桌面」.
+        let holds_inbox = self.state.window_holds_inbox(fence);
+        let desktops = if holds_inbox {
+            Vec::new()
+        } else {
+            self.desktop_labels()
+        };
+        if desktops.len() > 1 || (!holds_inbox && !h.virtual_desktops.is_empty()) {
+            let vd_menu = PopupMenu::new();
+            vd_menu
+                .item(
+                    CMD_FENCE_VD_ALL,
+                    pecofence_core::i18n::text("所有虚拟桌面"),
+                    h.virtual_desktops.is_empty(),
+                    false,
+                )
+                .separator();
+            for (i, (key, label, current)) in desktops.iter().enumerate().take(VD_MENU_MAX) {
+                let label = if *current {
+                    pecofence_core::i18n::format("{0}（当前）", std::slice::from_ref(label))
+                } else {
+                    label.clone()
+                };
+                let on = h
+                    .virtual_desktops
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(key));
+                vd_menu.item(CMD_FENCE_VD_BASE + i as u32, &label, on, false);
+            }
+            menu.submenu(pecofence_core::i18n::text("在哪个虚拟桌面显示"), vd_menu)
+                .icon(glyph::TASK_VIEW);
+        }
+        menu.item(
+            CMD_FENCE_OPTIONS,
+            pecofence_core::i18n::text("栅栏选项…"),
+            false,
+            false,
+        )
+        .icon(glyph::SETTING);
+        // The inbox cannot go (new desktop items land there), but it can stay out of sight
+        // while it is empty.
+        if f.kind == FenceKind::Inbox {
+            menu.item(
+                CMD_FENCE_HIDE_EMPTY,
+                pecofence_core::i18n::text("为空时自动隐藏"),
+                f.hide_when_empty,
+                false,
+            )
+            .item(
+                CMD_FENCE_DESKTOP_LAYOUT,
+                pecofence_core::i18n::text("像桌面一样排列"),
+                f.desktop_layout,
+                false,
+            )
+            .item(
+                CMD_FENCE_FREE_PLACEMENT,
+                pecofence_core::i18n::text("自由摆放"),
+                f.free_placement,
+                !f.desktop_layout,
+            );
+        } else {
+            menu.item(
+                CMD_FENCE_DELETE,
+                pecofence_core::i18n::text("删除栅栏"),
+                false,
+                false,
+            )
+            .icon(glyph::DELETE);
+        }
+        let add_menu = PopupMenu::new();
+        add_menu
+            .item(
+                CMD_FENCE_NEW,
+                pecofence_core::i18n::text("新建栅栏"),
+                false,
+                false,
+            )
+            .icon(glyph::ADD_TO);
+        if self.state.config.settings.tools.enabled {
+            add_menu
+                .item(
+                    CMD_FENCE_NEW_NOTE,
+                    pecofence_core::i18n::text("新建便签"),
+                    false,
+                    false,
+                )
+                .icon(glyph::NOTE)
+                .submenu(
+                    pecofence_core::i18n::text("新建小工具"),
+                    self.new_tool_submenu(CMD_FENCE_NEW_TOOL),
+                )
+                .icon(glyph::CODE);
+        }
+        add_menu
+            .submenu(
+                pecofence_core::i18n::text("在桌面显示文件夹"),
+                Self::show_folder_submenu(CMD_FENCE_SHOW_FOLDER),
+            )
+            .icon(glyph::FOLDER)
+            .item(
+                CMD_FENCE_NEW_SMART,
+                pecofence_core::i18n::text("新建智能栅栏…"),
+                false,
+                false,
+            )
+            .icon(glyph::SEARCH);
+        menu.separator()
+            .submenu(pecofence_core::i18n::text("添加到桌面"), add_menu)
+            .icon(glyph::MONITOR);
+        tracing::info!(
+            fence = %fence,
+            host = %host,
+            labels = ?menu.labels(),
+            "fence menu built"
+        );
+        let owner = self
+            .fences
+            .get(&host)
+            .map(|w| w.hwnd())
+            .unwrap_or(self.control.hwnd());
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
+        let cmd = self.track_menu("fence", || menu.show_context(owner, x, y));
+        tracing::info!(cmd, "fence menu closed");
+        match cmd {
+            CMD_FENCE_ROLL => self.toggle_roll(host),
+            CMD_FENCE_RENAME => self.begin_rename(fence),
+            CMD_TAB_NEW if !self.fence_room_or_notice() => {}
+            CMD_TAB_NEW => {
+                let rect = self.fences.get(&host).map(|w| w.rect()).unwrap_or(RECT {
+                    left: x,
+                    top: y,
+                    right: x + 240,
+                    bottom: y + 200,
+                });
+                if let Some(id) = self
+                    .state
+                    .new_fence(pecofence_core::i18n::text("新标签页"), rect)
+                {
+                    self.state.attach_tab(id, host);
+                    self.resync_windows();
+                    self.apply_fence_view(host);
+                    self.schedule_save();
+                }
+            }
+            CMD_TAB_DETACH => {
+                if let Some(change) = self.detach_tab(fence, x, y, false) {
+                    self.note_split_for_undo(change, false);
+                }
+            }
+            CMD_TAB_MOVE_LEFT => self.reorder_tab(host, fence, tab_idx.saturating_sub(1)),
+            CMD_TAB_MOVE_RIGHT => self.reorder_tab(host, fence, tab_idx + 1),
+            CMD_FENCE_PASTE => self.paste_into(fence),
+            c if c >= CMD_TAB_ATTACH_BASE
+                && c < CMD_TAB_ATTACH_BASE + self.state.host_fences().len() as u32 =>
+            {
+                let idx = (c - CMD_TAB_ATTACH_BASE) as usize;
+                // The merged window's tabs in their order (attach_tab adds them in storage
+                // order, which may interleave them with the target's tabs).
+                let moved = self.state.tabs_of(fence);
+                // Where a window of its own stood: Ctrl+Z puts it back there.
+                let before = (self.state.host_of(fence) == fence)
+                    .then(|| self.state.fence(fence).map(|f| self.state.fence_px_rect(f)))
+                    .flatten();
+                if let Some(target) = self.state.host_fences().get(idx).map(|o| o.id)
+                    && self.state.attach_tab(fence, target)
+                {
+                    for tab in &moved {
+                        self.state.reorder_tab(target, *tab, usize::MAX);
+                    }
+                    // The merged fence's own window (if it had one) goes away in resync.
+                    self.resync_windows();
+                    self.apply_fence_view(target);
+                    if let Some(w) = self.fences.get(&target) {
+                        self.queue.push(Command::RaiseFence(w.hwnd()));
+                    }
+                    if let Some(px) = before {
+                        self.note_menu_merge_for_undo(
+                            fence,
+                            &moved,
+                            RECT {
+                                left: px.left,
+                                top: px.top,
+                                right: px.right,
+                                bottom: px.bottom,
+                            },
+                        );
+                        // Its window had the keyboard and is gone (as after a merge by drag).
+                        self.give_keyboard(target, "a fence merged into it");
+                    }
+                    self.schedule_save();
+                }
+            }
+            CMD_FENCE_OPEN_FOLDER => self.open_portal_folder(fence, "fence menu"),
+            CMD_PORTAL_UP => self.portal_up(fence),
+            CMD_FENCE_FILTER => self.open_fence_filter(fence, "fence menu"),
+            CMD_FENCE_FILTER_CLEAR => self.set_fence_filter(fence, String::new(), "fence menu"),
+            CMD_FENCE_SAVE_SMART => self.save_filter_as_smart(fence, x, y),
+            CMD_FENCE_SMART_REFRESH => self.run_smart(fence, "fence menu"),
+            CMD_FENCE_SMART_FOLDER => {
+                // Each folder the search takes in its own Explorer window.
+                let dirs = self
+                    .state
+                    .smart_spec(fence)
+                    .map(|s| s.folders.clone())
+                    .unwrap_or_default();
+                let opened = dirs
+                    .iter()
+                    .filter(|d| super::portals::open_folder_in_explorer(std::path::Path::new(d)))
+                    .count();
+                tracing::info!(%fence, folders = dirs.len(), opened, "smart fence: its folders opened in Explorer");
+            }
+            CMD_FENCE_SMART_EVERYTHING => self.start_or_install_everything("fence menu"),
+            c if (CMD_FENCE_SHOW_FOLDER..CMD_FENCE_SHOW_FOLDER + 4).contains(&c) => {
+                self.show_folder_command(c - CMD_FENCE_SHOW_FOLDER, x, y, Some(host))
+            }
+            CMD_FENCE_NEW_SMART => self.queue.push(Command::OpenSmartEditor {
+                fence: None,
+                x,
+                y,
+                by: "fence menu",
+            }),
+            CMD_FENCE_SMART_EDIT => self.queue.push(Command::OpenSmartEditor {
+                fence: Some(fence),
+                x,
+                y,
+                by: "fence menu",
+            }),
+            CMD_PORTAL_HOME => {
+                if self.state.portal_home(fence) {
+                    self.after_portal_navigation(fence, -1, None);
+                }
+            }
+            CMD_FENCE_NEW_FOLDER => self.create_desktop_item(fence, true),
+            CMD_FENCE_NEW_TEXT => self.create_desktop_item(fence, false),
+            CMD_FENCE_ICON_FIRST..=CMD_FENCE_ICON_LAST => {
+                let size = ICON_SIZE_PRESETS[(cmd - CMD_FENCE_ICON_FIRST) as usize];
+                self.apply_icon_size(fence, size);
+            }
+            CMD_FENCE_VIEW_ICONS | CMD_FENCE_VIEW_LIST | CMD_FENCE_VIEW_DETAILS => {
+                let layout = match cmd {
+                    CMD_FENCE_VIEW_LIST => ViewLayout::List,
+                    CMD_FENCE_VIEW_DETAILS => ViewLayout::Details,
+                    _ => ViewLayout::Icons,
+                };
+                self.state.set_layout(fence, layout);
+                self.show_grid(fence);
+                self.apply_cell_snap(fence);
+                self.apply_auto_height(fence);
+                self.schedule_save();
+            }
+            CMD_FENCE_SORT_MANUAL
+            | CMD_FENCE_SORT_NAME
+            | CMD_FENCE_SORT_TYPE
+            | CMD_FENCE_SORT_DATE
+            | CMD_FENCE_SORT_SIZE
+            | CMD_FENCE_SORT_OPENED => {
+                let sort = match cmd {
+                    CMD_FENCE_SORT_NAME => SortMode::Name,
+                    CMD_FENCE_SORT_TYPE => SortMode::Type,
+                    CMD_FENCE_SORT_DATE => SortMode::Date,
+                    CMD_FENCE_SORT_SIZE => SortMode::Size,
+                    CMD_FENCE_SORT_OPENED => SortMode::OpenCount,
+                    _ => SortMode::Manual,
+                };
+                self.state.set_sort(fence, sort);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            CMD_FENCE_SORT_REVERSE => {
+                self.state.set_reverse(fence, !f.view.reverse);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            CMD_FENCE_SORT_FOLDERS_FIRST => {
+                self.state.set_folders_first(fence, !f.view.folders_first);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            CMD_FENCE_SORT_GROUP => {
+                // Also switches to date order; `refresh_fence` pushes the flag, the re-sorted
+                // items, the header indicator and the auto height.
+                self.state.set_group_by_date(fence, !f.view.group_by_date);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            CMD_FENCE_LOCK => self.set_fence_locked(host, !h.locked),
+            CMD_FENCE_VD_ALL => {
+                self.set_fence_desktops(host, Vec::new(), "fence menu");
+            }
+            c if (CMD_FENCE_VD_BASE..CMD_FENCE_VD_BASE + desktops.len() as u32).contains(&c) => {
+                let key = desktops[(c - CMD_FENCE_VD_BASE) as usize].0.clone();
+                self.set_fence_desktops(host, vec![key], "fence menu");
+            }
+            CMD_FENCE_FIT => self.fit_to_content_by_user(fence, "fence menu"),
+            CMD_FENCE_OPTIONS => self.open_fence_options(fence),
+            CMD_FENCE_NEW => {
+                let rect = self.place_new_fence(3, 200.0, x, y, Some(host));
+                self.create_fence_with_rename(rect);
+            }
+            CMD_FENCE_NEW_NOTE => self.queue.push(Command::NewNote { x, y }),
+            c if (CMD_FENCE_NEW_TOOL..CMD_FENCE_NEW_TOOL + 5).contains(&c) => {
+                self.new_tool_command(c - CMD_FENCE_NEW_TOOL, x, y)
+            }
+            CMD_FENCE_CLOCK_SECONDS => {
+                let mut settings = self.state.config.settings.clone();
+                settings.tools.clock_seconds = !settings.tools.clock_seconds;
+                self.apply_settings(settings, "clock menu");
+            }
+            CMD_FENCE_EDIT_NOTE => self.edit_note(fence, None),
+            CMD_FENCE_ADD_TODO => self.add_note_todo(fence),
+            CMD_FENCE_SCRIPT_RUN => self.refresh_script(fence),
+            CMD_FENCE_SCRIPT_EDIT => self.edit_script(fence),
+            CMD_FENCE_SCRIPT_PICK => self.pick_script_for(fence),
+            CMD_FENCE_SCRIPT_FOLDER => self.open_script_folder(fence),
+            c if (CMD_FENCE_SCRIPT_INTERVAL_BASE
+                ..CMD_FENCE_SCRIPT_INTERVAL_BASE
+                    + pecofence_core::ScriptSpec::INTERVALS.len() as u32)
+                .contains(&c) =>
+            {
+                let minutes = pecofence_core::ScriptSpec::INTERVALS
+                    [(c - CMD_FENCE_SCRIPT_INTERVAL_BASE) as usize];
+                self.set_script_interval(fence, minutes);
+            }
+            CMD_FENCE_DELETE => self.delete_fence_from_menu(fence),
+            CMD_FENCE_HIDE_EMPTY => self.set_fence_hide_when_empty(fence, !f.hide_when_empty),
+            CMD_FENCE_DESKTOP_LAYOUT => {
+                self.set_fence_desktop_layout(fence, !f.desktop_layout, "fence menu")
+            }
+            CMD_FENCE_FREE_PLACEMENT => {
+                self.set_fence_free_placement(fence, !f.free_placement, "fence menu")
+            }
+            _ => return,
+        }
+        // An open settings page shows these fences too; keep it current.
+        self.push_settings_state();
+    }
+
+    /// Right-click on the Details header: Explorer's column chooser (名称 always on).
+    pub(super) fn show_header_menu(&mut self, fence: FenceId, x: i32, y: i32) {
+        let Some(f) = self.state.fence(fence).cloned() else {
+            return;
+        };
+        let mut vis = f.view.columns_visible.unwrap_or([true; 3]);
+        let menu = PopupMenu::new();
+        menu.item(CMD_COL_NAME, pecofence_core::i18n::text("名称"), true, true)
+            .item(
+                CMD_COL_DATE,
+                pecofence_core::i18n::text("修改日期"),
+                vis[0],
+                false,
+            )
+            .item(
+                CMD_COL_TYPE,
+                pecofence_core::i18n::text("类型"),
+                vis[1],
+                false,
+            )
+            .item(
+                CMD_COL_SIZE,
+                pecofence_core::i18n::text("大小"),
+                vis[2],
+                false,
+            )
+            .separator()
+            .item(
+                CMD_COL_RESET_WIDTHS,
+                pecofence_core::i18n::text("恢复默认列宽"),
+                false,
+                false,
+            );
+        let owner = self
+            .window_for(fence)
+            .map(|w| w.hwnd())
+            .unwrap_or(self.control.hwnd());
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
+        let cmd = self.track_menu("columns", || menu.show_context(owner, x, y));
+        match cmd {
+            CMD_COL_DATE | CMD_COL_TYPE | CMD_COL_SIZE => {
+                let i = match cmd {
+                    CMD_COL_DATE => 0,
+                    CMD_COL_TYPE => 1,
+                    _ => 2,
+                };
+                vis[i] = !vis[i];
+                self.state.set_columns_visible(fence, vis);
+                if let Some(w) = self.window_for(fence)
+                    && w.active_fence() == fence
+                {
+                    w.set_columns_visible(vis);
+                }
+                self.apply_auto_height(fence);
+                self.schedule_save();
+            }
+            CMD_COL_RESET_WIDTHS => {
+                let widths = crate::layout::DetailColumns::DEFAULT_WIDTHS;
+                self.state.set_column_widths(fence, widths);
+                if let Some(w) = self.window_for(fence)
+                    && w.active_fence() == fence
+                {
+                    w.set_column_widths(widths);
+                }
+                self.schedule_save();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A glyph the icon font of this Windows lacks is drawn as an empty box beside the menu
+    /// item (退出 PecoFence on Windows 10 1809, #219).
+    #[test]
+    fn the_icon_font_has_every_menu_glyph() {
+        for glyph in super::glyph::all() {
+            assert!(
+                pecofence_platform::fonts::icon_font_has(glyph),
+                "U+{:04X} is not in {}",
+                glyph as u32,
+                pecofence_platform::fonts::icon_face()
+            );
+        }
+    }
+}

@@ -1,0 +1,1201 @@
+use super::dnd::url_shortcut_base_name;
+use super::items::{pasted_duplicates, pasted_to_select};
+
+/// Files of one paste that arrive one after the other: a later one joins the pasted icons
+/// selected before, and nothing is selected (so nothing scrolls and no name box closes) while
+/// a name box is open in the fence or when nothing new has arrived.
+#[test]
+fn a_later_pasted_file_joins_the_selection_unless_a_name_box_is_open() {
+    let (first, second) = (
+        pecofence_core::ItemId::new_v4(),
+        pecofence_core::ItemId::new_v4(),
+    );
+    // The first arrival is selected on its own.
+    assert_eq!(pasted_to_select(&[], &[first], false), Some(vec![first]));
+    // The second joins it; the first stays selected.
+    assert_eq!(
+        pasted_to_select(&[first], &[first, second], false),
+        Some(vec![first, second])
+    );
+    // F2 on the first, then the second arrives: the paste waits.
+    assert_eq!(pasted_to_select(&[first], &[first, second], true), None);
+    assert_eq!(pasted_to_select(&[], &[first], true), None);
+    // Nothing new: nothing to select again.
+    assert_eq!(
+        pasted_to_select(&[first, second], &[second, first], false),
+        None
+    );
+    // The first was renamed meanwhile (its path no longer counts as arrived): it stays selected.
+    assert_eq!(
+        pasted_to_select(&[first], &[second], false),
+        Some(vec![first, second])
+    );
+}
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+/// A paste that copies files within their own folder: only the new entries named after a
+/// copied file count as its copies, whatever language Explorer names them in.
+#[test]
+fn pasted_copies_are_the_new_entries_named_after_a_source() {
+    let set = |names: &[&str]| -> HashSet<PathBuf> {
+        names
+            .iter()
+            .map(|n| PathBuf::from(format!(r"C:\Users\me\Desktop\{n}")))
+            .collect()
+    };
+    let known = set(&["报告.txt", "Photos", "v1.2", "notes.md", "报告 - 副本.txt"]);
+    let sources: Vec<PathBuf> = set(&["报告.txt", "Photos", "v1.2"]).into_iter().collect();
+    let now = set(&[
+        "报告.txt",
+        "Photos",
+        "v1.2",
+        "notes.md",
+        "报告 - 副本.txt",
+        // The copies: another copy of the file (Explorer numbers it) and the folders' copies
+        // (a folder's copy has the words after its whole name).
+        "报告 - 副本 (2).TXT",
+        "Photos - Copy",
+        "v1.2 - Copy",
+        // Not copies: another program's download, another type, names that only start alike.
+        "download.zip",
+        "报告 - 副本.docx",
+        "报告单.txt",
+        "notes - Copy.md",
+    ]);
+    let copies = pasted_duplicates(&known, &now, &sources);
+    let names: Vec<String> = copies
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        ["Photos - Copy", "v1.2 - Copy", "报告 - 副本 (2).TXT"]
+    );
+    // Claimed once: entries already known are not reported again.
+    let mut known = known;
+    known.extend(copies);
+    assert!(pasted_duplicates(&known, &now, &sources).is_empty());
+}
+
+#[test]
+fn url_shortcut_names_prefer_the_browser_title() {
+    assert_eq!(
+        url_shortcut_base_name(Some("Rust: fast?.url"), "https://www.rust-lang.org/"),
+        "Rust- fast-"
+    );
+    assert_eq!(
+        url_shortcut_base_name(None, "https://example.com/docs/page.html?x=1"),
+        "example.com - page.html"
+    );
+    assert_eq!(
+        url_shortcut_base_name(None, "https://example.com"),
+        "example.com"
+    );
+    assert_eq!(
+        url_shortcut_base_name(Some("   "), "https://"),
+        "新建 Internet 快捷方式"
+    );
+}
+
+/// The time limit after which a Peek raises the covered fences without the frame clock's beats
+/// stays clear of a compositor clock's beats and is short enough to matter on a slow clock.
+#[test]
+fn the_peek_raise_limit_leaves_a_compositor_clock_its_beats() {
+    use super::peek::{PEEK_RAISE_FRAMES, PEEK_RAISE_LIMIT_MS};
+    // A compositor clock paces frames at 60 Hz or faster (a slower one gets a frame from the
+    // timer between its ticks), so the beats the covered fences wait for come within 40 ms.
+    // The limit stays clear of them, or the timer would raise the fences on every PC, and it
+    // is short enough to matter on a clock whose first beats take 60 to 130 ms.
+    let beats_ms = (f64::from(PEEK_RAISE_FRAMES) + 1.0) * 1000.0 / 60.0;
+    assert!(f64::from(PEEK_RAISE_LIMIT_MS) >= beats_ms + 10.0);
+    const { assert!(PEEK_RAISE_LIMIT_MS <= 80) };
+}
+
+/// Peek search matches the shown name or the file name (its extension may be hidden), ignoring
+/// case; namespace items match by their shown name only.
+#[test]
+fn peek_search_matches_names_and_hidden_extensions() {
+    let search_matches = |name: &str, path: Option<&str>, q: &str| {
+        super::peek::search_match(name, path, q).is_some()
+    };
+    let report = Some(r"c:\users\me\desktop\report 2026.pdf");
+    assert!(search_matches("Report 2026", report, "port 20"));
+    assert!(search_matches("Report 2026", report, ".pdf"));
+    assert!(!search_matches("Report 2026", report, "docx"));
+    assert!(search_matches(
+        "会议记录.docx",
+        Some(r"c:\d\会议记录.docx"),
+        "记录"
+    ));
+    let bin = Some("::{645ff040-5081-101b-9f08-00aa002f954e}");
+    assert!(search_matches("回收站", bin, "回收"));
+    assert!(!search_matches("回收站", bin, "645"));
+    assert!(search_matches("Shell item", None, "shell"));
+}
+
+/// Whole-row rounding never grows a fence into a neighbour: a downward fence stops at the fence
+/// below, an upward one (its title row at the bottom) at the fence above.
+mod cell_snap {
+    use super::super::arrange::GridSteps;
+    use pecofence_platform::RECT;
+
+    const STEPS: GridSteps = GridSteps {
+        cols: None,
+        row: 100.0,
+        fixed: 40.0,
+        cells: true,
+    };
+    const R: RECT = RECT {
+        left: 0,
+        top: 300,
+        right: 200,
+        bottom: 600,
+    };
+
+    #[test]
+    fn rows_stop_at_the_fence_on_the_growing_side() {
+        assert_eq!(STEPS.height_up_to(440, &R, None, false), 440);
+        assert_eq!(STEPS.height_up_to(440, &R, Some(650), false), 350);
+        assert_eq!(STEPS.height_up_to(340, &R, Some(650), false), 340);
+        assert_eq!(STEPS.height_up_to(440, &R, Some(250), true), 350);
+        assert_eq!(STEPS.height_up_to(340, &R, Some(250), true), 340);
+        // Already past the limit: it keeps its height, and one row at least.
+        assert_eq!(STEPS.height_up_to(440, &R, Some(580), false), 300);
+        assert_eq!(STEPS.height_up_to(440, &R, Some(320), true), 300);
+        let short = RECT { top: 500, ..R };
+        assert_eq!(STEPS.height_up_to(440, &short, Some(480), true), 140);
+    }
+}
+
+/// Ctrl+wheel resizes the icons unless the fence is locked; 像桌面一样排列 has no lock.
+#[test]
+fn ctrl_wheel_skips_locked_fences_but_not_the_desktop_arranged_one() {
+    use super::fences::ctrl_wheel_resizes;
+    assert!(ctrl_wheel_resizes(false, false));
+    assert!(!ctrl_wheel_resizes(true, false));
+    assert!(ctrl_wheel_resizes(true, true));
+    assert!(ctrl_wheel_resizes(false, true));
+}
+
+mod ipc {
+    use super::super::fence_options::{FenceProp, is_live_tick, parse_fence_prop};
+    use super::super::ipc::{
+        AUTO_SNAPSHOT_PREFIX, MAX_NAME_CHARS, MIN_EXPIRY_MS, adjusted, auto_snapshot_slot,
+        check_rule_conditions, checked_name, clamp_to_work, is_inbox_alias, patch_settings_path,
+        prune_auto_snapshots, request_expiry, rolled_back_settings, snapshot_changes, snapshot_dto,
+        validate_rect, visible_settings_json,
+    };
+    use pecofence_core::geometry::WorkArea;
+    use pecofence_core::{Cond, MAX_SNAPSHOTS, Settings, Snapshot, ViewLayout};
+    use pecofence_ipc::{ErrorCode, Rect};
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn work(device: &str, left: i32, top: i32, w: i32, h: i32, dpi: u32) -> WorkArea {
+        WorkArea {
+            device_path: device.into(),
+            gdi_name: String::new(),
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+            dpi,
+            mon_left: left,
+            mon_top: top,
+            mon_right: left + w,
+            mon_bottom: top + h + 40,
+        }
+    }
+
+    fn two_monitors() -> Vec<WorkArea> {
+        vec![
+            work("primary", 0, 0, 1920, 1040, 96),
+            // A 150 % monitor to the left, taller than the primary.
+            work("left", -2560, -200, 2560, 1400, 144),
+        ]
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn rect_validation_accepts_rects_centred_on_a_monitor() {
+        let areas = two_monitors();
+        assert_eq!(
+            validate_rect(rect(100, 100, 300, 200), &areas)
+                .unwrap()
+                .device_path,
+            "primary"
+        );
+        // Hanging off the edge is fine as long as the centre is on screen.
+        assert_eq!(
+            validate_rect(rect(-2700, 0, 400, 300), &areas)
+                .unwrap()
+                .device_path,
+            "left"
+        );
+        // Minimum size scales with the monitor's DPI: 64x36 DIP is 96x54 px at 150 %.
+        assert!(validate_rect(rect(-1000, 500, 64, 36), &areas).is_err());
+        assert!(validate_rect(rect(-1000, 500, 96, 54), &areas).is_ok());
+        assert!(validate_rect(rect(500, 500, 64, 36), &areas).is_ok());
+    }
+
+    #[test]
+    fn rect_validation_rejects_overflow_offscreen_and_bad_sizes() {
+        let areas = two_monitors();
+        let err = validate_rect(rect(i32::MAX - 10, 0, 300, 200), &areas).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert!(err.message.contains("overflow"), "{}", err.message);
+        let err = validate_rect(rect(0, i32::MAX, 300, 200), &areas).unwrap_err();
+        assert!(err.message.contains("overflow"), "{}", err.message);
+
+        let err = validate_rect(rect(0, 0, 0, 200), &areas).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert!(err.message.contains("positive"), "{}", err.message);
+        assert!(validate_rect(rect(0, 0, 300, -1), &areas).is_err());
+
+        // Centre below both monitors' work areas (on the primary's taskbar strip).
+        let err = validate_rect(rect(100, 1030, 300, 200), &areas).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert_eq!(
+            err.message,
+            "rect centre is outside every monitor's work area"
+        );
+        let details = err.details.unwrap();
+        assert_eq!(details["workAreas"].as_array().unwrap().len(), 2);
+        assert_eq!(details["centre"], json!({ "x": 250, "y": 1130 }));
+        // Far to the right of everything.
+        assert!(validate_rect(rect(5000, 0, 300, 200), &areas).is_err());
+        // Nothing connected.
+        assert!(validate_rect(rect(0, 0, 300, 200), &[]).is_err());
+
+        // Too small on the primary (36 px wide) and too large (over 8192 DIP).
+        let err = validate_rect(rect(500, 500, 36, 100), &areas).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert!(
+            err.message.contains("outside the allowed range"),
+            "{}",
+            err.message
+        );
+        assert!(validate_rect(rect(-4000, 500, 9000, 9000), &areas).is_err());
+        // 8192 DIP at 150 % is 12288 px: allowed on the left monitor, whose work area holds
+        // the centre (-1280, 500); the same size is over the limit on the 96 dpi primary.
+        assert!(validate_rect(rect(-7424, -5644, 12288, 12288), &areas).is_ok());
+        assert!(validate_rect(rect(-5184, -5624, 12288, 12288), &areas).is_err());
+    }
+
+    /// `fence move` / `resize` / `fit` put the window where the saved geometry puts the fence:
+    /// on its work area, as `geometry::denormalize` places it, which is the rect the reply's
+    /// `adjusted.applied` reports (release test: a 向上展开 fence resized to 600 px kept its
+    /// window 230 px above the screen, and a rolled one moved to y 420 had its title row
+    /// below the 720 px work area).
+    #[test]
+    fn cli_rects_are_clamped_like_the_saved_geometry() {
+        use pecofence_core::geometry::{PxRect, denormalize, normalize};
+        let small = work("vm", 0, 0, 1024, 720, 96);
+        assert_eq!(
+            clamp_to_work(rect(890, -230, 120, 600), &small),
+            rect(890, 0, 120, 600)
+        );
+        assert_eq!(
+            clamp_to_work(rect(890, 420, 120, 386), &small),
+            rect(890, 334, 120, 386)
+        );
+        // Inside: unchanged.
+        assert_eq!(
+            clamp_to_work(rect(890, 40, 120, 330), &small),
+            rect(890, 40, 120, 330)
+        );
+        // Taller than the work area: cut to it, at its top.
+        assert_eq!(
+            clamp_to_work(rect(100, 200, 300, 900), &small),
+            rect(100, 0, 300, 720)
+        );
+        let areas = two_monitors();
+        // Past the left edge of the monitor to the left of the primary.
+        assert_eq!(
+            clamp_to_work(rect(-2700, 0, 400, 300), &areas[1]),
+            rect(-2560, 0, 400, 300)
+        );
+        for (r, wa) in [
+            (rect(890, -230, 120, 600), &small),
+            (rect(890, 420, 120, 386), &small),
+            (rect(1800, 900, 300, 200), &areas[0]),
+            (rect(-2700, -300, 451, 303), &areas[1]),
+            (rect(-200, 1100, 600, 500), &areas[1]),
+        ] {
+            let c = clamp_to_work(r, wa);
+            let px = PxRect {
+                left: r.x,
+                top: r.y,
+                right: r.x + r.w,
+                bottom: r.y + r.h,
+            };
+            let saved = denormalize(&normalize(px, wa), wa);
+            let near = |a: i32, b: i32| (a - b).abs() <= 1;
+            assert!(
+                near(c.x, saved.left)
+                    && near(c.y, saved.top)
+                    && near(c.w, saved.width())
+                    && near(c.h, saved.height()),
+                "{r:?} on {}: clamped {c:?}, saved {saved:?}",
+                wa.device_path
+            );
+        }
+    }
+
+    #[test]
+    fn names_are_trimmed_and_length_limited() {
+        assert_eq!(checked_name("title", "  Work  ").unwrap(), "Work");
+        let err = checked_name("title", "   ").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert!(err.message.contains("title"), "{}", err.message);
+        let just_fits = "字".repeat(MAX_NAME_CHARS);
+        assert_eq!(checked_name("rule name", &just_fits).unwrap(), just_fits);
+        let too_long = "x".repeat(MAX_NAME_CHARS + 1);
+        let err = checked_name("snapshot name", &too_long).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert!(err.message.contains("257"), "{}", err.message);
+        assert_eq!(err.details.unwrap()["max"], json!(MAX_NAME_CHARS));
+        // Surrounding whitespace does not count.
+        let padded = format!("  {}  ", "y".repeat(MAX_NAME_CHARS));
+        assert!(checked_name("title", &padded).is_ok());
+        // parse_fence_prop("title") goes through the same check.
+        let err = parse_fence_prop("title", &json!(too_long)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+    }
+
+    #[test]
+    fn tiny_timeouts_still_run_once() {
+        assert_eq!(request_expiry(0), Duration::from_millis(MIN_EXPIRY_MS));
+        assert_eq!(request_expiry(50), Duration::from_millis(MIN_EXPIRY_MS));
+        assert_eq!(request_expiry(15_000), Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn rules_need_a_condition() {
+        let err = check_rule_conditions(&[]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        assert!(
+            err.message.contains("at least one condition"),
+            "{}",
+            err.message
+        );
+        // The hint once named `describe rules.add`, which the CLI does not have.
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("describe --schema Cond")),
+            "{:?}",
+            err.hint
+        );
+        assert!(check_rule_conditions(&[Cond::Ext(vec![".pdf".into()])]).is_ok());
+    }
+
+    #[test]
+    fn inbox_alias_is_case_insensitive() {
+        assert!(is_inbox_alias("inbox"));
+        assert!(is_inbox_alias(" INBOX "));
+        assert!(is_inbox_alias("Inbox"));
+        assert!(!is_inbox_alias("inbox2"));
+        assert!(!is_inbox_alias("桌面"));
+    }
+
+    #[test]
+    fn rolled_back_settings_names_the_kept_keys() {
+        // Asked to show the real icons (default: hidden), but Explorer refused.
+        let requested = Settings {
+            hide_real_icons: false,
+            icon_size: 64,
+            ..Default::default()
+        };
+        let applied = Settings {
+            icon_size: 64,
+            ..Default::default()
+        };
+        assert!(applied.hide_real_icons);
+        assert_eq!(
+            rolled_back_settings(&requested, &applied),
+            vec!["hideRealIcons".to_string()]
+        );
+        assert!(rolled_back_settings(&applied, &applied).is_empty());
+    }
+
+    #[test]
+    fn settings_patch_sets_a_nested_bool() {
+        let current = Settings::default();
+        assert!(current.peek.enabled);
+        let patched = patch_settings_path(&current, "peek.enabled", json!(false)).unwrap();
+        assert!(!patched.peek.enabled);
+        // Everything else untouched.
+        assert_eq!(patched.peek.dim, current.peek.dim);
+        assert_eq!(patched.icon_size, current.icon_size);
+    }
+
+    #[test]
+    fn settings_patch_rejects_unknown_keys_with_the_valid_ones() {
+        let err = patch_settings_path(&Settings::default(), "peek.nope", json!(1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPath);
+        let allowed = err.details.unwrap()["allowed"].clone();
+        assert!(
+            allowed.as_array().unwrap().contains(&json!("enabled")),
+            "{allowed}"
+        );
+        assert!(err.hint.unwrap().contains("peek"));
+
+        let err = patch_settings_path(&Settings::default(), "nope", json!(1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPath);
+        assert!(err.hint.unwrap().starts_with("Top-level keys"));
+    }
+
+    #[test]
+    fn unused_settings_are_hidden_and_refused() {
+        let current = Settings::default();
+        let visible = visible_settings_json(&current).unwrap();
+        assert!(visible.pointer("/quickHide/delayMs").is_none());
+        assert!(visible.pointer("/quickHide/enabled").is_some());
+        assert!(visible.get("telemetry").is_none());
+        for path in pecofence_core::UNUSED_SETTINGS {
+            let err = patch_settings_path(&current, path, json!(1)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidPath, "{path}");
+        }
+        // `settings get` output fed back whole still applies.
+        let mut edited = visible.clone();
+        edited["iconSize"] = json!(64);
+        let patched = patch_settings_path(&current, "", edited).unwrap();
+        assert_eq!(patched.icon_size, 64);
+        assert_eq!(patched.quick_hide.enabled, current.quick_hide.enabled);
+    }
+
+    #[test]
+    fn settings_patch_rejects_wrong_types_and_ranges() {
+        let err =
+            patch_settings_path(&Settings::default(), "peek.enabled", json!("yes")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationFailed);
+        assert!(
+            err.details.unwrap()["expected"]
+                .as_str()
+                .unwrap()
+                .contains("bool")
+        );
+
+        for size in [20, 50, 132] {
+            let err =
+                patch_settings_path(&Settings::default(), "iconSize", json!(size)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::ValidationFailed, "{size}");
+            assert!(
+                err.message.contains("24 and 128 in steps of 4"),
+                "{}",
+                err.message
+            );
+            assert_eq!(
+                err.details.unwrap()["expected"],
+                json!({ "min": 24, "max": 128, "step": 4 })
+            );
+        }
+        for size in [24, 52, 128] {
+            let patched =
+                patch_settings_path(&Settings::default(), "iconSize", json!(size)).unwrap();
+            assert_eq!(patched.icon_size, size);
+        }
+        // A size stored outside the range blocks only a change of the size itself; any other
+        // change rounds it into the range, as loading the file does.
+        let stored = Settings {
+            icon_size: 50,
+            ..Settings::default()
+        };
+        let patched = patch_settings_path(&stored, "peek.enabled", json!(false)).unwrap();
+        assert_eq!(patched.icon_size, 52);
+        assert!(patch_settings_path(&stored, "iconSize", json!(54)).is_err());
+        assert_eq!(
+            patch_settings_path(&stored, "iconSize", json!(52))
+                .unwrap()
+                .icon_size,
+            52
+        );
+
+        // Numbers the app would clamp: the ranges it clamps to.
+        for (path, value) in [
+            ("snapping.gapPx", json!(1000)),
+            ("snapping.gapPx", json!(-3)),
+            ("icons.tintStrength", json!(5)),
+            ("icons.tintStrength", json!(-1)),
+        ] {
+            let err = patch_settings_path(&Settings::default(), path, value).unwrap_err();
+            assert_eq!(err.code, ErrorCode::ValidationFailed, "{path}");
+        }
+        let patched = patch_settings_path(&Settings::default(), "snapping.gapPx", json!(64));
+        assert_eq!(patched.unwrap().snapping.gap_px, 64);
+        // One already stored outside them does not block other paths.
+        let mut stored = Settings::default();
+        stored.snapping.gap_px = 1000;
+        assert!(patch_settings_path(&stored, "peek.dim", json!(false)).is_ok());
+
+        // Enum paths: the serde error names the variants.
+        let err = patch_settings_path(&Settings::default(), "theme", json!("neon")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationFailed);
+        assert!(err.message.contains("expected one of"), "{}", err.message);
+    }
+
+    #[test]
+    fn settings_patch_checks_and_normalizes_the_custom_peek_shortcut() {
+        let current = Settings::default();
+        let patched =
+            patch_settings_path(&current, "peek.customHotkey", json!("ctrl + shift + f")).unwrap();
+        assert_eq!(patched.peek.custom_hotkey.as_deref(), Some("Ctrl+Shift+F"));
+        // Ctrl+Alt+Space is the preset every version reads.
+        let mut legacy = current.clone();
+        legacy.peek.hotkey = pecofence_core::PeekHotkey::WinSpace;
+        let patched =
+            patch_settings_path(&legacy, "peek.customHotkey", json!("Ctrl+Alt+Space")).unwrap();
+        assert_eq!(patched.peek, current.peek);
+        for text in ["Ctrl+Space", "Win+L", "Shift+F", "Ctrl+Alt+Ä", "Ctrl+Alt"] {
+            let err = patch_settings_path(&current, "peek.customHotkey", json!(text)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::ValidationFailed, "{text}");
+            assert!(err.message.contains("cannot be used"), "{}", err.message);
+        }
+        // Back to the preset; an unusable value already in the file does not block other paths.
+        let mut stored = current.clone();
+        stored.peek.custom_hotkey = Some("nonsense".into());
+        let patched = patch_settings_path(&stored, "peek.dim", json!(false)).unwrap();
+        assert_eq!(patched.peek.custom_hotkey.as_deref(), Some("nonsense"));
+        let patched = patch_settings_path(&stored, "peek.customHotkey", json!(null)).unwrap();
+        assert_eq!(patched.peek.custom_hotkey, None);
+        // Setting peek.hotkey picks that one, even the Ctrl+Alt+Space a custom shortcut keeps
+        // there for older versions.
+        let mut custom = current.clone();
+        custom.peek.custom_hotkey = Some("Ctrl+Shift+F".into());
+        for value in ["ctrlAltSpace", "winShiftSpace"] {
+            let patched = patch_settings_path(&custom, "peek.hotkey", json!(value)).unwrap();
+            assert_eq!(patched.peek.custom_hotkey, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn settings_patch_of_a_peek_shortcut_replaces_double_ctrl() {
+        let mut double = Settings::default();
+        double.peek.double_ctrl = true;
+        for (path, value) in [
+            ("peek.customHotkey", json!("Ctrl+Shift+F")),
+            ("peek.customHotkey", json!(null)),
+            ("peek.hotkey", json!("ctrlAltSpace")),
+        ] {
+            let patched = patch_settings_path(&double, path, value.clone()).unwrap();
+            assert!(!patched.peek.double_ctrl, "{path} {value}");
+        }
+        // Other paths keep it; a patch that sets it too keeps what it says.
+        let patched = patch_settings_path(&double, "peek.dim", json!(false)).unwrap();
+        assert!(patched.peek.double_ctrl);
+        let patched = patch_settings_path(
+            &Settings::default(),
+            "peek",
+            json!({ "enabled": true, "dim": true, "hotkey": "ctrlAltSpace", "customHotkey": "Ctrl+Shift+F", "doubleCtrl": true }),
+        )
+        .unwrap();
+        assert!(patched.peek.double_ctrl);
+        let patched =
+            patch_settings_path(&Settings::default(), "peek.doubleCtrl", json!(true)).unwrap();
+        assert!(patched.peek.double_ctrl);
+    }
+
+    #[test]
+    fn settings_patch_replaces_the_whole_object() {
+        let wanted = Settings {
+            icon_size: 64,
+            peek: pecofence_core::PeekSettings {
+                dim: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&wanted).unwrap();
+        let patched = patch_settings_path(&Settings::default(), "", value).unwrap();
+        assert_eq!(patched, wanted);
+
+        let err = patch_settings_path(&Settings::default(), "", json!(true)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationFailed);
+        let err = patch_settings_path(&Settings::default(), "", json!({})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationFailed);
+    }
+
+    /// Only `live: true` holds the cell snap, so a slider's release, sent without the flag,
+    /// snaps.
+    #[test]
+    fn only_live_slider_ticks_hold_the_cell_snap() {
+        let tick = json!({ "type": "setFence", "id": "x", "prop": "iconSize", "value": 52 });
+        assert!(!is_live_tick(&tick));
+        let mut live = tick.clone();
+        live["live"] = json!(true);
+        assert!(is_live_tick(&live));
+        live["live"] = json!(false);
+        assert!(!is_live_tick(&live));
+        live["live"] = json!("true");
+        assert!(!is_live_tick(&live));
+    }
+
+    #[test]
+    fn fence_props_are_validated() {
+        let err = parse_fence_prop("nope", &json!(1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        let allowed = err.details.unwrap()["allowed"].clone();
+        for p in [
+            "title",
+            "iconSize",
+            "layout",
+            "labelLines",
+            "titleOnHover",
+            "transparentOnHover",
+            "expandUpward",
+            "portalTitleIcon",
+        ] {
+            assert!(allowed.as_array().unwrap().contains(&json!(p)), "{allowed}");
+        }
+
+        for bad in [
+            json!(50),
+            json!(20),
+            json!(132),
+            json!(-48),
+            json!(48.5),
+            json!("48"),
+        ] {
+            let err = parse_fence_prop("iconSize", &bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidValue, "{bad}");
+            assert!(
+                err.message.contains("allowed: 24 to 128 in steps of 4"),
+                "{}",
+                err.message
+            );
+            assert_eq!(
+                err.details.unwrap()["allowed"],
+                json!(["24 to 128 in steps of 4"])
+            );
+        }
+        for size in [24, 52, 64, 128] {
+            assert_eq!(
+                parse_fence_prop("iconSize", &json!(size)).unwrap(),
+                FenceProp::IconSize(size)
+            );
+        }
+
+        // A preset and a free value both set the spacing in DIPs.
+        assert_eq!(
+            parse_fence_prop("spacing", &json!("compact")).unwrap(),
+            FenceProp::Spacing(-12)
+        );
+        assert_eq!(
+            parse_fence_prop("spacing", &json!("loose")).unwrap(),
+            FenceProp::Spacing(16)
+        );
+        for px in [-12, 0, 8, 32] {
+            assert_eq!(
+                parse_fence_prop("spacingPx", &json!(px)).unwrap(),
+                FenceProp::Spacing(px)
+            );
+        }
+        for bad in [
+            json!(-16),
+            json!(36),
+            json!(6),
+            json!(8.5),
+            json!("8"),
+            json!(null),
+        ] {
+            let err = parse_fence_prop("spacingPx", &bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidValue, "{bad}");
+            assert_eq!(
+                err.details.unwrap()["allowed"],
+                json!(["-12 to 32 in steps of 4"])
+            );
+        }
+
+        assert_eq!(
+            parse_fence_prop("layout", &json!("list")).unwrap(),
+            FenceProp::Layout(ViewLayout::List)
+        );
+        assert_eq!(
+            parse_fence_prop("tint", &json!("#ABCDEF")).unwrap(),
+            FenceProp::Tint(Some([0xAB, 0xCD, 0xEF]))
+        );
+        assert_eq!(
+            parse_fence_prop("tint", &serde_json::Value::Null).unwrap(),
+            FenceProp::Tint(None)
+        );
+        let err = parse_fence_prop("tint", &json!("red")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidValue);
+        // Issue #40: a tab's own bar colour, a title-row-only tint, an 18 DIP title.
+        assert_eq!(
+            parse_fence_prop("tabColor", &json!("#E74856")).unwrap(),
+            FenceProp::TabColor(Some([0xE7, 0x48, 0x56]))
+        );
+        assert_eq!(
+            parse_fence_prop("tabColor", &serde_json::Value::Null).unwrap(),
+            FenceProp::TabColor(None)
+        );
+        assert_eq!(
+            parse_fence_prop("tintTitleOnly", &json!(true)).unwrap(),
+            FenceProp::TintTitleOnly(true)
+        );
+        assert_eq!(
+            parse_fence_prop("transparentOnHover", &json!(true)).unwrap(),
+            FenceProp::TransparentOnHover(true)
+        );
+        assert!(parse_fence_prop("transparentOnHover", &json!("on")).is_err());
+        assert_eq!(
+            parse_fence_prop("iconAlign", &json!("right")).unwrap(),
+            FenceProp::IconAlign(pecofence_core::IconAlign::Right)
+        );
+        assert_eq!(
+            parse_fence_prop("titleSize", &json!("extraLarge")).unwrap(),
+            FenceProp::TitleSize(Some(pecofence_core::TitleSize::ExtraLarge))
+        );
+        // linux.do: the text of notes and script fences in four sizes.
+        assert_eq!(
+            parse_fence_prop("textSize", &json!("extraLarge")).unwrap(),
+            FenceProp::TextSize(Some(pecofence_core::TitleSize::ExtraLarge))
+        );
+        assert_eq!(
+            parse_fence_prop("textSize", &json!("normal")).unwrap(),
+            FenceProp::TextSize(None)
+        );
+        assert_eq!(
+            parse_fence_prop("textSize", &json!(24)).unwrap_err().code,
+            ErrorCode::InvalidValue
+        );
+        assert_eq!(
+            parse_fence_prop("hideWhenEmpty", &json!(true)).unwrap(),
+            FenceProp::HideWhenEmpty(true)
+        );
+        // Issue #125: the bottom edge stays put.
+        assert_eq!(
+            parse_fence_prop("expandUpward", &json!(true)).unwrap(),
+            FenceProp::ExpandUpward(true)
+        );
+        assert_eq!(
+            parse_fence_prop("expandUpward", &json!("up"))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidValue
+        );
+        assert_eq!(
+            parse_fence_prop("openFoldersInside", &json!(true)).unwrap(),
+            FenceProp::OpenFoldersInside(true)
+        );
+        assert_eq!(
+            parse_fence_prop("opacity", &json!("transparent")).unwrap(),
+            FenceProp::Opacity(Some(0.0))
+        );
+        assert_eq!(
+            parse_fence_prop("opacity", &json!("default")).unwrap(),
+            FenceProp::Opacity(None)
+        );
+        for (value, on) in [
+            ("default", None),
+            ("hover", Some(true)),
+            ("always", Some(false)),
+        ] {
+            assert_eq!(
+                parse_fence_prop("titleOnHover", &json!(value)).unwrap(),
+                FenceProp::TitleOnHover(on)
+            );
+        }
+        assert_eq!(
+            parse_fence_prop("titleOnHover", &json!(true))
+                .unwrap_err()
+                .details
+                .unwrap()["allowed"],
+            json!(["default", "hover", "always"])
+        );
+        assert_eq!(
+            parse_fence_prop("labelLines", &json!(4))
+                .unwrap_err()
+                .details
+                .unwrap()["allowed"],
+            json!(["0", "1", "2", "3"])
+        );
+        assert_eq!(
+            parse_fence_prop("labelLines", &json!(0)).unwrap(),
+            FenceProp::LabelLines(0)
+        );
+        assert_eq!(
+            parse_fence_prop("locked", &json!("true")).unwrap_err().code,
+            ErrorCode::InvalidValue
+        );
+        assert_eq!(
+            parse_fence_prop("title", &json!("  ")).unwrap_err().code,
+            ErrorCode::InvalidValue
+        );
+    }
+
+    fn snap(name: &str, ts: i64) -> Snapshot {
+        Snapshot {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            ts,
+            layouts: Vec::new(),
+            notes: Default::default(),
+            scripts: Default::default(),
+        }
+    }
+
+    fn layout(devices: &[&str], fences: usize) -> pecofence_core::Layout {
+        let geometry = pecofence_core::NormGeometry {
+            monitor: devices[0].to_string(),
+            x: 0.0,
+            y: 0.0,
+            w: 300.0,
+            h: 200.0,
+            work_w: 1920.0,
+            work_h: 1032.0,
+            anchor: pecofence_core::Anchor::LeftTop,
+        };
+        pecofence_core::Layout {
+            shown: 0,
+            fingerprint: devices
+                .iter()
+                .map(|d| pecofence_core::MonitorIdentity {
+                    gdi_name: String::new(),
+                    screen_px: [0, 0],
+                    device_path: d.to_string(),
+                    work_dip: [1920.0, 1032.0],
+                    dpi: 96,
+                })
+                .collect(),
+            fences: (0..fences)
+                .map(|i| {
+                    pecofence_core::Fence::new(
+                        &format!("f{i}"),
+                        pecofence_core::FenceKind::Virtual,
+                        geometry.clone(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn adjusted_ignores_the_one_pixel_dip_round_trip() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        assert_eq!(
+            adjusted(r(10, 10, 300, 200), r(11, 9, 301, 199), "clamped"),
+            None
+        );
+        let a = adjusted(r(2250, 40, 1360, 517), r(2250, 40, 1360, 458), "cellSnap").unwrap();
+        assert_eq!(
+            (a.applied.h, a.requested.h, a.reason.as_str()),
+            (458, 517, "cellSnap")
+        );
+    }
+
+    #[test]
+    fn snapshot_counts_the_fences_a_restore_shows() {
+        // One layout per monitor combination seen: the old sum (6 here) read like 3x the fences.
+        let mut s = snap("before-cleanup", 1);
+        s.layouts = vec![
+            layout(&["\\\\.\\DISPLAY1"], 2),
+            layout(&["\\\\.\\DISPLAY1", "\\\\.\\DISPLAY2"], 3),
+            layout(&["\\\\.\\DISPLAY2"], 1),
+        ];
+        let at = |device: &str| work(device, 0, 0, 1920, 1032, 96);
+        let elsewhere = [at("\\\\.\\DISPLAY9")];
+        // Every monitor set shows the same fences, as the layout shown last has them.
+        s.layouts[1].shown = 4;
+        s.layouts[2].shown = 2;
+        assert_eq!(snapshot_dto(&s, &elsewhere).fence_count, 3);
+        // Snapshots from 0.1.3 kept fences per set: those of the current monitors' layout.
+        for l in &mut s.layouts {
+            l.shown = 0;
+        }
+        let now = [at("\\\\.\\DISPLAY2"), at("\\\\.\\DISPLAY1")];
+        assert_eq!(snapshot_dto(&s, &now).fence_count, 3);
+        // No layout for these monitors: a restore would start from the first one.
+        assert_eq!(snapshot_dto(&s, &elsewhere).fence_count, 2);
+        assert_eq!(snapshot_dto(&snap("x", 2), &now).fence_count, 0);
+    }
+
+    #[test]
+    fn a_snapshot_dry_run_lists_added_removed_moved_and_updated_fences() {
+        let now = layout(&["\\\\.\\DISPLAY1"], 4).fences;
+        let mut then = now.clone();
+        // f0 stays as it is, f1 moves, f2 rolls up and gains a title, f3 is not in the snapshot.
+        then[1].geometry.x = 400.0;
+        then[2].rolled_up = true;
+        then[2].title = "Games".into();
+        then.truncate(3);
+        let extra = layout(&["\\\\.\\DISPLAY1"], 1).fences.remove(0);
+        then.push(extra.clone());
+        let rect = |f: &pecofence_core::Fence| Rect {
+            x: f.geometry.x as i32,
+            y: f.geometry.y as i32,
+            w: f.geometry.w as i32,
+            h: f.geometry.h as i32,
+        };
+        let [added, removed, moved, updated] = snapshot_changes(&now, &then, rect);
+        let ids = |list: &[pecofence_ipc::SnapshotFenceDto]| -> Vec<uuid::Uuid> {
+            list.iter().map(|f| f.id).collect()
+        };
+        assert_eq!(ids(&added), [extra.id]);
+        assert_eq!(ids(&removed), [now[3].id]);
+        assert_eq!(ids(&moved), [now[1].id]);
+        assert_eq!((moved[0].from.unwrap().x, moved[0].to.unwrap().x), (0, 400));
+        assert!(moved[0].fields.is_empty());
+        assert_eq!(ids(&updated), [now[2].id]);
+        assert_eq!(updated[0].fields, ["rolledUp", "title"]);
+        assert_eq!(updated[0].title, "Games");
+        // Nothing to restore: every list is empty.
+        assert!(snapshot_changes(&now, &now, rect).iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn auto_snapshots_rotate_and_leave_user_snapshots_alone() {
+        let mut list = vec![
+            snap("mine", 1),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}a"), 2),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}b"), 3),
+            snap("yours", 4),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}c"), 5),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}d"), 6),
+        ];
+        let oldest_auto = list[1].id;
+        let evicted = prune_auto_snapshots(&mut list, 3, None);
+        assert_eq!(evicted, vec![oldest_auto]);
+        let names: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["mine", "auto-cli-b", "yours", "auto-cli-c", "auto-cli-d"]
+        );
+        assert!(prune_auto_snapshots(&mut list, 3, None).is_empty());
+    }
+
+    #[test]
+    fn restoring_the_oldest_auto_snapshot_keeps_it() {
+        // Three auto snapshots and a restore of the oldest: the slot for the restore's own
+        // backup must evict the next oldest, not the snapshot being restored.
+        let mut list = vec![
+            snap("base", 1),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}a"), 2),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}b"), 3),
+            snap(&format!("{AUTO_SNAPSHOT_PREFIX}c"), 4),
+        ];
+        let (oldest, next) = (list[1].id, list[2].id);
+        assert!(auto_snapshot_slot(&mut list, Some(oldest)));
+        assert!(
+            list.iter().any(|s| s.id == oldest),
+            "restore target evicted"
+        );
+        assert!(list.iter().all(|s| s.id != next));
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn auto_snapshot_makes_room_by_dropping_automatic_snapshots_only() {
+        // Full list: MAX-2 user snapshots plus two auto ones. Pruning to KEPT-1 (= 2) removes
+        // nothing; the oldest automatic one gives its slot, as on the settings page.
+        let mut list: Vec<Snapshot> = (0..MAX_SNAPSHOTS - 2)
+            .map(|i| snap(&format!("mine {i}"), i as i64))
+            .collect();
+        let users: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        list.push(snap(&format!("{AUTO_SNAPSHOT_PREFIX}a"), 100));
+        let oldest_auto = list.last().unwrap().id;
+        list.push(snap(&format!("{AUTO_SNAPSHOT_PREFIX}b"), 101));
+        assert!(auto_snapshot_slot(&mut list, None));
+        assert_eq!(list.len(), MAX_SNAPSHOTS - 1);
+        assert!(list.iter().all(|s| s.id != oldest_auto));
+        assert!(users.iter().all(|u| list.iter().any(|s| s.id == *u)));
+
+        // Full list with one automatic snapshot of the settings page: it gives its slot too
+        // (the CLI went on without a safety snapshot before), unless it is the one to restore.
+        let mut list: Vec<Snapshot> = (0..MAX_SNAPSHOTS - 1)
+            .map(|i| snap(&format!("mine {i}"), i as i64))
+            .collect();
+        list.push(snap(pecofence_core::i18n::text("恢复快照前"), 100));
+        let page_auto = list.last().unwrap().id;
+        let before: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        assert!(!auto_snapshot_slot(&mut list, Some(page_auto)));
+        let after: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        assert_eq!(after, before, "the snapshot to restore stays");
+        assert!(auto_snapshot_slot(&mut list, None));
+        assert_eq!(list.len(), MAX_SNAPSHOTS - 1);
+        assert!(list.iter().all(|s| s.id != page_auto));
+
+        // Three auto snapshots in a full list: the oldest goes, a slot opens, every user
+        // snapshot survives.
+        let mut list: Vec<Snapshot> = (0..MAX_SNAPSHOTS - 3)
+            .map(|i| snap(&format!("mine {i}"), i as i64))
+            .collect();
+        let users: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        list.push(snap(&format!("{AUTO_SNAPSHOT_PREFIX}a"), 100));
+        let oldest_auto = list.last().unwrap().id;
+        list.push(snap(&format!("{AUTO_SNAPSHOT_PREFIX}b"), 101));
+        list.push(snap(&format!("{AUTO_SNAPSHOT_PREFIX}c"), 102));
+        assert!(auto_snapshot_slot(&mut list, None));
+        assert_eq!(list.len(), MAX_SNAPSHOTS - 1);
+        assert!(list.iter().all(|s| s.id != oldest_auto));
+        assert!(users.iter().all(|u| list.iter().any(|s| s.id == *u)));
+
+        // Full list of user snapshots only: refused, untouched.
+        let mut list: Vec<Snapshot> = (0..MAX_SNAPSHOTS)
+            .map(|i| snap(&format!("mine {i}"), i as i64))
+            .collect();
+        let before: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        assert!(!auto_snapshot_slot(&mut list, None));
+        let after: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        assert_eq!(after, before);
+
+        // Plenty of room: nothing pruned beyond the rotation, slot granted.
+        let mut list = vec![snap("mine", 1)];
+        assert!(auto_snapshot_slot(&mut list, None));
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn the_page_names_the_command_lines_safety_snapshots() {
+        use super::super::settings::snapshot_label;
+        assert_eq!(
+            snapshot_label("auto-cli-2026-11-12 04:45:20"),
+            pecofence_core::i18n::text("命令行操作前")
+        );
+        assert_eq!(snapshot_label("我的布局"), "我的布局");
+    }
+
+    #[test]
+    fn page_auto_snapshots_make_room_from_automatic_ones_only() {
+        use super::super::settings::snapshot_room;
+        let before_restore = pecofence_core::i18n::text("恢复快照前");
+        // Not full: nothing goes.
+        let mut list = vec![snap("home", 1), snap(before_restore, 2)];
+        assert!(snapshot_room(&mut list, None));
+        assert_eq!(list.len(), 2);
+
+        // Full: the oldest automatic one goes (not the restore target), never the user's.
+        let mut list: Vec<Snapshot> = vec![snap("home", 0), snap(before_restore, 1)];
+        let target = list[1].id;
+        list.push(snap(before_restore, 2));
+        let next = list[2].id;
+        list.extend((3..MAX_SNAPSHOTS).map(|i| snap(&format!("mine {i}"), i as i64)));
+        assert_eq!(list.len(), MAX_SNAPSHOTS);
+        assert!(snapshot_room(&mut list, Some(target)));
+        assert_eq!(list.len(), MAX_SNAPSHOTS - 1);
+        assert!(list.iter().all(|s| s.id != next));
+        assert!(list.iter().any(|s| s.id == target));
+        assert_eq!(list[0].name, "home");
+
+        // Full of the user's own: refused, untouched.
+        let mut list: Vec<Snapshot> = (0..MAX_SNAPSHOTS)
+            .map(|i| snap(&format!("mine {i}"), i as i64))
+            .collect();
+        assert!(!snapshot_room(&mut list, None));
+        assert_eq!(list.len(), MAX_SNAPSHOTS);
+    }
+
+    #[test]
+    fn user_saves_on_a_full_list_replace_automatic_snapshots_oldest_first() {
+        // Feedback #76: restores from the settings page piled up 「恢复快照前」 snapshots until
+        // `snapshot save` failed with limit_reached.
+        use super::super::settings::snapshot_room;
+        let before_restore = pecofence_core::i18n::text("恢复快照前");
+        let mut list: Vec<Snapshot> = (0..MAX_SNAPSHOTS - 3)
+            .map(|i| snap(&format!("mine {i}"), i as i64))
+            .collect();
+        list.insert(2, snap(before_restore, 50));
+        list.push(snap(&format!("{AUTO_SNAPSHOT_PREFIX}a"), 100));
+        list.push(snap(before_restore, 101));
+        let autos: Vec<uuid::Uuid> = list
+            .iter()
+            .filter(|s| !s.name.starts_with("mine"))
+            .map(|s| s.id)
+            .collect();
+        let users: Vec<uuid::Uuid> = list
+            .iter()
+            .filter(|s| s.name.starts_with("mine"))
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(list.len(), MAX_SNAPSHOTS);
+        for (n, gone) in autos.iter().enumerate() {
+            assert!(snapshot_room(&mut list, None), "save {n} refused");
+            assert!(list.iter().all(|s| s.id != *gone), "save {n} kept {gone}");
+            list.push(snap(&format!("new {n}"), 200 + n as i64));
+            assert_eq!(list.len(), MAX_SNAPSHOTS);
+        }
+        // Only the user's own are left: the next save is refused and nothing goes.
+        assert!(users.iter().all(|u| list.iter().any(|s| s.id == *u)));
+        let before: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        assert!(!snapshot_room(&mut list, None));
+        let after: Vec<uuid::Uuid> = list.iter().map(|s| s.id).collect();
+        assert_eq!(after, before);
+    }
+}
+
+/// The shell menu prewarm is made for the first shortcut that leads to a file on a fixed local
+/// drive: Windows builds a shortcut's menu from its target's, so a shortcut to a folder, to a
+/// network place or to a drive that is not there is left alone, and the disk is asked about a
+/// target on a fixed drive only.
+#[test]
+fn the_shell_menu_prewarm_takes_a_shortcut_to_a_local_file() {
+    use super::{prewarm_passes_over, prewarm_pick};
+    use std::path::Path;
+    let target = |p: &'static str| Some(Path::new(p));
+    let file = |_: &Path| Some(true);
+    let folder = |_: &Path| Some(false);
+    let nothing = |_: &Path| None;
+    let never = |_: &Path| -> Option<bool> { panic!("the disk is asked for a fixed drive only") };
+    assert_eq!(
+        prewarm_passes_over(target(r"C:\Windows\notepad.exe"), "fixed", file),
+        None
+    );
+    assert_eq!(
+        prewarm_passes_over(target(r"C:\Users"), "fixed", folder),
+        Some("target is a folder")
+    );
+    assert_eq!(
+        prewarm_passes_over(target(r"C:\gone\a.exe"), "fixed", nothing),
+        Some("target is missing")
+    );
+    assert_eq!(
+        prewarm_passes_over(target(r"\\server\share\a.exe"), "unc", never),
+        Some("target on a network share")
+    );
+    assert_eq!(
+        prewarm_passes_over(target(r"Z:\a.exe"), "network", never),
+        Some("target on a network drive")
+    );
+    assert_eq!(
+        prewarm_passes_over(target(r"Q:\none\a.exe"), "unknown", never),
+        Some("target on a drive that is not there")
+    );
+    assert_eq!(
+        prewarm_passes_over(target(r"E:\a.exe"), "removable", never),
+        Some("target on a removable drive")
+    );
+    assert_eq!(
+        prewarm_passes_over(None, "unknown", never),
+        Some("no target path")
+    );
+
+    let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+    let shortcuts = paths(&["!a.lnk", "b.lnk", "c.lnk", "d.lnk"]);
+    let files = paths(&["gone.txt", "e.txt", "f.txt"]);
+    let there = |p: &Path| p != Path::new("gone.txt");
+    // The first shortcut that fits, in order; the ones before it with their reasons.
+    let odd = |p: &Path| match p.to_str() {
+        Some("!a.lnk") => Some("target is a folder"),
+        Some("b.lnk") => Some("target on a network share"),
+        _ => None,
+    };
+    let (file, passed) = prewarm_pick(&shortcuts, &files, odd, there);
+    assert_eq!(file, Some((Path::new("c.lnk"), "shortcut")));
+    assert_eq!(passed, ["target is a folder", "target on a network share"]);
+    // Every shortcut fits: the first one, as before.
+    let (file, passed) = prewarm_pick(&shortcuts, &files, |_| None, there);
+    assert_eq!(file, Some((Path::new("!a.lnk"), "shortcut")));
+    assert!(passed.is_empty());
+    // No shortcut fits: the first other file that is there.
+    let (file, passed) = prewarm_pick(&shortcuts, &files, |_| Some("target is a folder"), there);
+    assert_eq!(file, Some((Path::new("e.txt"), "plain file")));
+    assert_eq!(passed.len(), 4);
+    // Nothing fits: no prewarm.
+    let (file, _) = prewarm_pick(&shortcuts, &[], |_| Some("no target path"), there);
+    assert_eq!(file, None);
+}

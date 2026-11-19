@@ -1,0 +1,867 @@
+//! Live wallpapers (Wallpaper Engine, Lively, ...) hide the Windows wallpaper behind their
+//! player window, so the backdrops show captures of that window instead (feedback #24). A
+//! capture is a still picture: Liquid Glass frosts it (see `MonitorRecipe::show_live`), and it
+//! is taken again for a new window, after a wallpaper signal, when the desktop comes to the
+//! front, and once a minute while a fence on that monitor can be seen.
+
+use super::visuals::{MonitorRecipe, backdrop_signature, monitor_recipes, unreadable_monitors};
+use super::*;
+use crate::commands::WM_APP_LIVE_WALLPAPER;
+use pecofence_platform::live_wallpaper;
+
+/// A visible fence's backdrop catches up with the live wallpaper this often.
+pub(super) const LIVE_REFRESH: Duration = Duration::from_secs(60);
+/// The desktop came to the front: no new capture if the last one is this recent.
+pub(super) const LIVE_FRONT_REFRESH: Duration = Duration::from_secs(2);
+/// A new window (every window after a wallpaper signal) is captured again at every check (at
+/// most every `LIVE_SETTLE_REFRESH`) for this long: a player that just started can show a black
+/// or half-loaded picture for seconds.
+const LIVE_SETTLE: Duration = Duration::from_secs(15);
+const LIVE_SETTLE_REFRESH: Duration = Duration::from_secs(3);
+/// Switching to another wallpaper, a player can close a moment before the next one shows: a
+/// monitor goes back to the Windows wallpaper once its window is missing this long.
+const LIVE_GONE_AFTER: Duration = Duration::from_secs(2);
+/// A capture whose result has not come back after this is given up (see
+/// `capture_live_wallpapers`).
+const LIVE_CAPTURE_GIVE_UP: Duration = Duration::from_secs(30);
+/// Captures are kept this many times smaller than the monitor: Fluent builds its backdrop at
+/// that size, and frosted glass shows no more detail.
+const CAPTURE_DOWNSCALE: u32 = 4;
+/// Wallpaper Engine's clone mode shows one monitor's wallpaper on the others in windows of this
+/// class, through a DWM thumbnail of the window it copies (feedback #55).
+const CLONE_CLASS: &str = "WPECloneView";
+/// A settled window whose captures came back empty this many times in a row draws nothing
+/// PrintWindow can read.
+const BLIND_AFTER: u32 = 3;
+
+impl LiveWallpaper {
+    /// The class of the window that shows it (`WPEDesktopDX11Window`), for feedback reports.
+    pub(super) fn class(&self) -> String {
+        desktop::class_name(HWND(self.hwnd as *mut core::ffi::c_void))
+    }
+}
+
+/// The live wallpaper covering one monitor.
+#[derive(Clone)]
+pub(super) struct LiveWallpaper {
+    /// The monitor as the wallpaper snapshot lists it (virtual-screen pixels).
+    pub(super) monitor: RECT,
+    hwnd: isize,
+    /// When `hwnd` first covered the monitor, or a wallpaper signal came: it settles from then
+    /// (see `LIVE_SETTLE`).
+    since: Instant,
+    /// Since when no window covers the monitor.
+    missing: Option<Instant>,
+    /// The last good capture of the monitor; until one works its backdrop shows the Windows
+    /// wallpaper. A new window keeps the previous window's capture until its own.
+    pub(super) image: Option<Arc<Image>>,
+    /// The window and time of the last capture attempt.
+    attempted: Option<(isize, Instant)>,
+    /// The window whose empty capture was logged (once per window).
+    reported: Option<isize>,
+    /// Empty captures of `hwnd` in a row once it settled.
+    empty: u32,
+    /// `hwnd` cannot be captured (no redirection bitmap, or `BLIND_AFTER` empty captures): the
+    /// backdrop shows a neutral colour, not an old capture or the Windows wallpaper under it.
+    pub(super) blind: bool,
+}
+
+/// What the worker hands back: per monitor the recipe (with its new capture), the window when
+/// that capture worked, and the backdrop image built from it; then the windows whose capture
+/// came back empty, why, and whether the window a clone copies stood in.
+type Built = (
+    Vec<(MonitorRecipe, Option<isize>, Image)>,
+    Vec<(isize, &'static str, bool)>,
+);
+
+/// Captures running on a worker thread, with every monitor's backdrop built from them there:
+/// the Windows wallpaper of a monitor without a live one is decoded off the UI thread too.
+pub(super) struct LiveCapture {
+    /// The backdrops shown and `BackdropCache::generation` when it started: a rebuild since
+    /// (theme, wallpaper, monitors) makes its set stale.
+    shown: Option<String>,
+    generation: u64,
+    snapshot: wallpaper::WallpaperSnapshot,
+    file_signature: String,
+    started: Instant,
+    result: Arc<Mutex<Option<std::result::Result<Built, String>>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// The window's rectangle and opaque pixels, `CAPTURE_DOWNSCALE` times smaller (see
+/// `live_wallpaper::capture`), or why there are none.
+fn capture(hwnd: HWND) -> std::result::Result<(RECT, Image), &'static str> {
+    let (rect, mut image) = live_wallpaper::capture(hwnd, |bgra, width, height| {
+        Image::downscale_pixels(bgra, width, height, CAPTURE_DOWNSCALE)
+    })?;
+    let mut drawn = false;
+    for px in image.bgra.as_chunks_mut::<4>().0 {
+        drawn |= px[..3] != [0, 0, 0];
+        px[3] = 255;
+    }
+    if drawn {
+        Ok((rect, image))
+    } else {
+        Err("all black")
+    }
+}
+
+/// The window a Wallpaper Engine clone copies: a live wallpaper window of the same program that
+/// is no clone itself. A DWM thumbnail in a window inside the desktop can be left out of its
+/// PrintWindow, so the clone itself comes back black.
+fn clone_source(clone: HWND) -> Option<HWND> {
+    if desktop::class_name(clone) != CLONE_CLASS {
+        return None;
+    }
+    let pid = desktop::window_pid(clone);
+    live_wallpaper::windows()
+        .into_iter()
+        .map(|(hwnd, _)| hwnd)
+        .find(|&h| desktop::window_pid(h) == pid && desktop::class_name(h) != CLONE_CLASS)
+}
+
+/// `monitor`'s part of a capture of the window at `window`.
+fn monitor_part(window: RECT, shot: &Image, monitor: RECT) -> Image {
+    let d = CAPTURE_DOWNSCALE as i32;
+    shot.crop(
+        (monitor.left - window.left) / d,
+        (monitor.top - window.top) / d,
+        (monitor.right - monitor.left + d - 1) / d,
+        (monitor.bottom - monitor.top + d - 1) / d,
+    )
+}
+
+/// On the worker: captures each monitor's target window (once per window, which may span
+/// monitors) and builds every monitor's backdrop image. A capture that failed or came back
+/// black leaves the recipe's previous capture, except for a Wallpaper Engine clone: the whole
+/// picture of the window it copies stands in, stretched over its monitor as the clone shows it.
+fn capture_and_build(work: Vec<(MonitorRecipe, Option<isize>)>) -> Result<Built> {
+    // Per window: its rectangle (none for a clone's stand-in) and picture.
+    let mut shots: Vec<(isize, Option<(Option<RECT>, Image)>)> = Vec::new();
+    let mut empty = Vec::new();
+    let mut built = Vec::new();
+    for (mut recipe, target) in work {
+        let mut captured = None;
+        if let Some(hwnd) = target {
+            if !shots.iter().any(|(h, _)| *h == hwnd) {
+                let window = HWND(hwnd as *mut core::ffi::c_void);
+                let shot = match capture(window) {
+                    Ok((rect, image)) => Some((Some(rect), image)),
+                    Err(reason) => {
+                        let copied = clone_source(window).map(capture);
+                        // A clone of a window PrintWindow cannot read is as blind as it.
+                        let reason = match copied {
+                            Some(Err(live_wallpaper::NOT_REDIRECTED)) => {
+                                live_wallpaper::NOT_REDIRECTED
+                            }
+                            _ => reason,
+                        };
+                        let copied = copied.and_then(|copied| copied.ok());
+                        empty.push((hwnd, reason, copied.is_some()));
+                        copied.map(|(_, image)| (None, image))
+                    }
+                };
+                shots.push((hwnd, shot));
+            }
+            let shot = shots.iter().find(|(h, _)| *h == hwnd);
+            if let Some((_, Some((window, image)))) = shot {
+                let part = match window {
+                    Some(window) => monitor_part(*window, image, recipe.rect()),
+                    None => image.clone(),
+                };
+                recipe.show_live(Arc::new(part));
+                captured = Some(hwnd);
+            }
+        }
+        let image = recipe.build_image()?;
+        built.push((recipe, captured, image));
+    }
+    Ok((built, empty))
+}
+
+/// What the card and the settings page say about the live wallpaper under Liquid Glass fences.
+pub(super) struct LiveNote {
+    /// Its picture cannot be read (the fences are see-through panes); else they show a frosted
+    /// capture.
+    pub(super) unreadable: bool,
+    /// The player as a user knows it (None: not one of the known ones).
+    pub(super) player: Option<&'static str>,
+    /// What `notices.json` remembers the player by: that name, else its program file, else
+    /// its window class.
+    pub(super) key: String,
+    monitor: RECT,
+}
+
+/// The player's name as a user knows it, from its window class and program file. Wallpaper
+/// Engine: its two program files and its `WPE...` window classes. Lively plays videos in mpv
+/// and web pages in players of its own, all started from its folder (`Lively Wallpaper`, the
+/// Store package's `...LivelyWallpaper_...`): that folder, or one of its own program files
+/// (`Lively.exe`, `Lively.Player.CefSharp.exe` and the like, 1.x's `livelywpf.exe`). Anything
+/// else has no name: another program called `wallpaper...`, a Windows user called lively.
+fn player_name(class: &str, exe: Option<&Path>) -> Option<&'static str> {
+    let exe = exe.map(|p| p.to_string_lossy().to_ascii_lowercase());
+    let mut parts = exe.as_deref().unwrap_or_default().rsplit('\\');
+    let file = parts.next().unwrap_or_default();
+    let lively_folder =
+        |part: &str| part.contains("livelywallpaper") || part.contains("lively wallpaper");
+    if class.starts_with("WPE") || matches!(file, "wallpaper32.exe" | "wallpaper64.exe") {
+        Some("Wallpaper Engine")
+    } else if matches!(file, "lively.exe" | "livelywpf.exe")
+        || file.starts_with("lively.player")
+        || lively_folder(file)
+        || parts.any(lively_folder)
+    {
+        Some("Lively Wallpaper")
+    } else {
+        None
+    }
+}
+
+/// A fence with this opacity setting (`AppearanceOverride::opacity`, None: 默认) shows the
+/// see-through pane over a live wallpaper that cannot be read: not the fence arranged like the
+/// desktop (it has no plate), not a fully transparent one (no plate until the pointer is over
+/// it), not a 更厚实 one (its plate stays opaque: `material_opacity`).
+fn shows_pane(opacity: Option<f32>, desktop_arranged: bool) -> bool {
+    let opacity = opacity.unwrap_or(1.0);
+    !desktop_arranged && opacity > 0.0 && opacity <= 1.0
+}
+
+/// Why the live wallpaper card no longer says what the user sees (None: it still does): the
+/// look is not Liquid Glass, or no monitor's live wallpaper is unreadable any more. A player
+/// that is missing for a moment (`LIVE_GONE_AFTER`) keeps its entry, and the card.
+fn live_card_outdated(liquid_glass: bool, live: &[LiveWallpaper]) -> Option<&'static str> {
+    if !liquid_glass {
+        Some("the look is Fluent")
+    } else if live.is_empty() {
+        Some("the player ended")
+    } else if !live.iter().any(|l| l.blind) {
+        Some("the wallpaper can be read")
+    } else {
+        None
+    }
+}
+
+/// The foreground window's rectangle when it belongs to another program than Explorer and this
+/// one. The fences sit under other programs' windows: it hides the fences inside it, and a
+/// maximized or full-screen window every fence on its monitor.
+fn foreground_rect() -> Option<RECT> {
+    let root = desktop::root_ancestor(desktop::foreground_window());
+    let pid = desktop::window_pid(root);
+    let other = !root.0.is_null()
+        && pid != std::process::id()
+        && pid != desktop::window_pid(desktop::shell_window());
+    other.then(|| window::window_rect(root))
+}
+
+/// What `monitor`'s backdrops make of a live wallpaper, for `status`'s `liveWallpapers` (see
+/// `LiveWallpaperDto`).
+fn live_wallpaper_state(live: &[LiveWallpaper], monitor: RECT) -> &'static str {
+    match live.iter().find(|l| l.monitor == monitor) {
+        None => "none",
+        Some(l) if l.image.is_some() => "captured",
+        Some(l) if l.blind => "notCapturable",
+        Some(_) => "pending",
+    }
+}
+
+impl App {
+    /// `status.get`'s `liveWallpapers`: one entry per connected monitor.
+    pub(super) fn live_wallpaper_dtos(&self) -> Vec<pecofence_ipc::LiveWallpaperDto> {
+        self.state
+            .work_areas
+            .iter()
+            .map(|w| {
+                let monitor = RECT {
+                    left: w.mon_left,
+                    top: w.mon_top,
+                    right: w.mon_right,
+                    bottom: w.mon_bottom,
+                };
+                pecofence_ipc::LiveWallpaperDto {
+                    monitor: w.device_path.clone(),
+                    state: live_wallpaper_state(&self.live, monitor).to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// The live wallpaper the Liquid Glass fences are over: one whose picture cannot be read
+    /// first, else one they show a frosted capture of. None in Fluent, which has its plate
+    /// either way, and for a player whose window is gone (its monitor keeps its backdrop for
+    /// `LIVE_GONE_AFTER`: there is nobody to name).
+    pub(super) fn live_wallpaper_note(&self) -> Option<LiveNote> {
+        if !self.ctx.theme.borrow().liquid_glass {
+            return None;
+        }
+        let mut here = self.live.iter().filter(|l| l.missing.is_none());
+        let live = (here.clone().find(|l| l.blind)).or_else(|| here.find(|l| l.image.is_some()))?;
+        let hwnd = HWND(live.hwnd as *mut core::ffi::c_void);
+        let class = desktop::class_name(hwnd);
+        let exe = pecofence_platform::process::image_path(desktop::window_pid(hwnd));
+        let player = player_name(&class, exe.as_deref());
+        let file = exe.as_deref().and_then(|p| p.file_name());
+        let key = match (player, file) {
+            (Some(name), _) => name.to_string(),
+            (None, Some(file)) => file.to_string_lossy().to_ascii_lowercase(),
+            (None, None) => class,
+        };
+        Some(LiveNote {
+            unreadable: live.blind,
+            player,
+            key,
+            monitor: live.monitor,
+        })
+    }
+
+    /// After a wallpaper check or a capture: the settings page's line under 主题风格 follows
+    /// the live wallpaper's state, and the card that says why is offered.
+    pub(super) fn tell_live_wallpaper(&mut self) {
+        let note = self.live_wallpaper_note();
+        let now = note.as_ref().map(|n| (n.unreadable, n.player));
+        if now != self.live_told_page {
+            tracing::debug!(
+                ?now,
+                "live wallpaper under Liquid Glass changed; the settings page follows"
+            );
+            self.live_told_page = now;
+            self.push_settings_state();
+        }
+        self.retire_live_wallpaper_card();
+        if let Some(note) = note.filter(|n| n.unreadable) {
+            self.offer_live_wallpaper_card(note);
+        }
+    }
+
+    /// The card on screen says the fences are see-through panes and offers Fluent. Once that
+    /// no longer holds (the look is Fluent, the player ended, its picture can be read) it
+    /// leaves; it was not answered, so nothing is kept in `notices.json`. Called after every
+    /// wallpaper check and when the look changes.
+    pub(super) fn retire_live_wallpaper_card(&mut self) {
+        if !matches!(
+            self.welcome,
+            Some((_, welcome::Welcome::LiveWallpaper { .. }))
+        ) {
+            return;
+        }
+        let liquid_glass = self.ctx.theme.borrow().liquid_glass;
+        let Some(reason) = live_card_outdated(liquid_glass, &self.live) else {
+            return;
+        };
+        tracing::info!(
+            reason,
+            "live wallpaper card leaves: what it says no longer holds; not kept as answered"
+        );
+        if let Some((notice, _)) = self.welcome.take() {
+            notice.leave();
+        }
+    }
+
+    /// The live wallpaper card's button would switch a look the card no longer describes (see
+    /// `retire_live_wallpaper_card`: it leaves at the next check).
+    pub(super) fn live_card_outdated(&self) -> Option<&'static str> {
+        live_card_outdated(self.ctx.theme.borrow().liquid_glass, &self.live)
+    }
+
+    /// Liquid Glass fences on a monitor whose live wallpaper cannot be read are frosted panes:
+    /// one card says why and offers Fluent, once per player (`notices.json` keeps the players
+    /// it was answered for). It waits while another card is up or no fence shows the pane on
+    /// that monitor right then (see `shows_pane`; none does during a Peek, when the glass is
+    /// opaque), and comes at a later check.
+    fn offer_live_wallpaper_card(&mut self, note: LiveNote) {
+        if !self.notices {
+            return;
+        }
+        if self.live_card_told.is_none() {
+            self.live_card_told = Some(self.load_live_card_told());
+        }
+        if (self.live_card_told.iter().flatten()).any(|key| *key == note.key) {
+            return;
+        }
+        let m = note.monitor;
+        // By the fence's centre, as the pane itself (`over_unreadable_wallpaper`).
+        let shown = self.fences.iter().any(|(id, w)| {
+            let h = w.hwnd();
+            let f = window::window_rect(h);
+            let (cx, cy) = ((f.left + f.right) / 2, (f.top + f.bottom) / 2);
+            desktop::is_visible(h)
+                && !desktop::is_cloaked(h)
+                && cx >= m.left
+                && cx < m.right
+                && cy >= m.top
+                && cy < m.bottom
+                && self.state.fence(*id).is_some_and(|f| {
+                    shows_pane(
+                        f.appearance.as_ref().and_then(|a| a.opacity),
+                        w.is_desktop_arranged(),
+                    )
+                })
+        });
+        let waits = if self.ctx.behavior.floating.get() {
+            "the fences are up in a Peek, their glass opaque"
+        } else if !shown {
+            "no fence shows the pane on that monitor"
+        } else if self.notice_showing() {
+            "another card is up"
+        } else {
+            ""
+        };
+        if waits != self.live_card_waits {
+            self.live_card_waits = waits;
+            // `reason`: the shareable log keeps that field's fixed words.
+            let reason = waits;
+            tracing::info!(player = ?note.player, key = %note.key, reason, "live wallpaper card due");
+        }
+        if !waits.is_empty() {
+            return;
+        }
+        self.show_welcome(welcome::Welcome::LiveWallpaper {
+            player: note.player,
+            key: note.key.clone(),
+        });
+        if self.welcome.is_none() {
+            // The card could not be made (the log says why): not at every check of this run.
+            tracing::debug!(key = %note.key, "live wallpaper card not shown; not tried again in this run");
+            self.live_card_told.get_or_insert_default().push(note.key);
+        }
+    }
+
+    /// Follows which monitors a live wallpaper covers (`live_wallpaper::windows`, ~30 us). A
+    /// monitor without one goes back to the Windows wallpaper.
+    pub(super) fn detect_live_wallpapers(&mut self, snapshot: &wallpaper::WallpaperSnapshot) {
+        let windows = live_wallpaper::windows();
+        let mut gone = std::mem::take(&mut self.live);
+        for m in &snapshot.monitors {
+            let known = gone.iter().position(|l| l.monitor == m.rect);
+            let known = known.map(|i| gone.swap_remove(i));
+            match (live_wallpaper::covering(&windows, m.rect), known) {
+                (Some((hwnd, _)), known) => {
+                    let entry = known.unwrap_or_else(|| {
+                        let class = desktop::class_name(hwnd);
+                        tracing::info!(
+                            monitor = ?m.rect,
+                            class = %class,
+                            "live wallpaper found; backdrops follow it"
+                        );
+                        LiveWallpaper {
+                            monitor: m.rect,
+                            hwnd: 0,
+                            since: Instant::now(),
+                            missing: None,
+                            image: None,
+                            attempted: None,
+                            reported: None,
+                            empty: 0,
+                            blind: false,
+                        }
+                    });
+                    let hwnd = hwnd.0 as isize;
+                    // A new window keeps the previous one's picture (or `blind`) until its own
+                    // capture.
+                    let same = hwnd == entry.hwnd;
+                    self.live.push(LiveWallpaper {
+                        hwnd,
+                        since: if same { entry.since } else { Instant::now() },
+                        missing: None,
+                        empty: if same { entry.empty } else { 0 },
+                        ..entry
+                    });
+                }
+                (None, Some(mut entry)) => {
+                    let since = *entry.missing.get_or_insert_with(Instant::now);
+                    if since.elapsed() < LIVE_GONE_AFTER {
+                        self.live.push(entry);
+                    } else {
+                        gone.push(entry);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        for l in gone {
+            tracing::info!(
+                monitor = ?l.monitor,
+                "live wallpaper gone; backdrops follow the Windows wallpaper"
+            );
+        }
+    }
+
+    /// A wallpaper signal: the live wallpapers may have changed along with the Windows
+    /// wallpaper, and the backdrops may just have been rebuilt from their old captures. They
+    /// settle again like a new window: captured at the next check and then at every check for
+    /// `LIVE_SETTLE` (feedback #45).
+    pub(super) fn resettle_live_wallpapers(&mut self) {
+        let now = Instant::now();
+        for live in &mut self.live {
+            live.since = now;
+        }
+    }
+
+    /// Starts a worker capturing the live wallpapers that are due: a new window, or no attempt
+    /// for `min_age` (shorter while the window settles), on a monitor where a fence is shown
+    /// and not hidden behind the foreground window.
+    pub(super) fn capture_live_wallpapers(&mut self, min_age: Duration) {
+        let due = |l: &LiveWallpaper| {
+            let min_age = if l.since.elapsed() < LIVE_SETTLE {
+                min_age.min(LIVE_SETTLE_REFRESH)
+            } else {
+                min_age
+            };
+            l.attempted
+                .is_none_or(|(hwnd, at)| hwnd != l.hwnd || at.elapsed() >= min_age)
+        };
+        // A job whose result has not come back is given up, so it cannot stop every later
+        // capture. Its worker may still wait in PrintWindow for the player's thread, with a
+        // full-size bitmap: while one given-up worker still waits, the next job is kept.
+        let abandoned_waits = self
+            .live_abandoned
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished());
+        if let Some(job) = self.live_capture.take_if(|job| {
+            job.started.elapsed() >= LIVE_CAPTURE_GIVE_UP
+                && (job.thread.is_finished() || !abandoned_waits)
+        }) {
+            tracing::warn!("live wallpaper capture brought no result; starting again");
+            if !job.thread.is_finished() {
+                self.live_abandoned = Some(job.thread);
+            }
+        }
+        if self.live_capture.is_some()
+            || !self.live.iter().any(due)
+            || pecofence_core::brand::var_os("PECOFENCE_SOLID").is_some()
+        {
+            return;
+        }
+        let foreground = foreground_rect();
+        let fences: Vec<RECT> = self
+            .fences
+            .values()
+            .map(FenceWindow::hwnd)
+            .filter(|&h| desktop::is_visible(h) && !desktop::is_cloaked(h))
+            .map(window::window_rect)
+            .filter(|f| {
+                !foreground.is_some_and(|g| {
+                    g.left <= f.left && g.top <= f.top && g.right >= f.right && g.bottom >= f.bottom
+                })
+            })
+            .collect();
+        let now = Instant::now();
+        let mut targets = Vec::new();
+        for l in self.live.iter_mut().filter(|l| due(l)) {
+            let m = l.monitor;
+            let shown = fences.iter().any(|f| {
+                f.left < m.right && f.right > m.left && f.top < m.bottom && f.bottom > m.top
+            });
+            if shown {
+                l.attempted = Some((l.hwnd, now));
+                targets.push((m, l.hwnd));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        // The last check's read (asking Explorer here would wait on it on the UI thread): its
+        // monitors and the pictures beside the live wallpapers.
+        let Some(snapshot) = self.last_wallpaper.clone() else {
+            return;
+        };
+        let theme = *self.ctx.theme.borrow();
+        let work: Vec<_> = monitor_recipes(&theme, &snapshot, &self.live)
+            .into_iter()
+            .map(|recipe| {
+                let target = targets.iter().find(|(m, _)| *m == recipe.rect());
+                (recipe, target.map(|(_, hwnd)| *hwnd))
+            })
+            .collect();
+        let result = Arc::new(Mutex::new(None));
+        let spawned = {
+            let result = result.clone();
+            let control = self.control.hwnd().0 as isize;
+            std::thread::Builder::new()
+                .name("pecofence-live-wallpaper".into())
+                .spawn(move || {
+                    let built = pecofence_platform::com::MtaGuard::init()
+                        .and_then(|_com| capture_and_build(work))
+                        .map_err(|error| error.to_string());
+                    if let Ok(mut slot) = result.lock() {
+                        *slot = Some(built);
+                    }
+                    window::post_message(
+                        HWND(control as *mut core::ffi::c_void),
+                        WM_APP_LIVE_WALLPAPER,
+                        0,
+                        0,
+                    );
+                })
+        };
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(error) => {
+                tracing::warn!(%error, "live wallpaper capture thread failed to start");
+                return;
+            }
+        };
+        self.live_capture = Some(LiveCapture {
+            shown: self.wallpaper_sig.clone(),
+            generation: self.wallpaper_cache.generation(),
+            file_signature: snapshot.signature(),
+            snapshot,
+            started: now,
+            result,
+            thread,
+        });
+    }
+
+    /// The worker finished: keep the captures that worked and show the backdrops built from
+    /// them. Without a new capture the current backdrop stays; after a rebuild meanwhile the
+    /// backdrops are built again with them.
+    pub(super) fn finish_live_capture(&mut self) {
+        let Some(job) = self.live_capture.take() else {
+            return;
+        };
+        let Some(result) = job.result.lock().ok().and_then(|mut slot| slot.take()) else {
+            self.live_capture = Some(job);
+            return;
+        };
+        let (built, empty) = match result {
+            Ok(built) => built,
+            Err(error) => {
+                tracing::debug!(%error, "live wallpaper backdrop failed");
+                return;
+            }
+        };
+        // A window without a redirection bitmap never shows PrintWindow anything: its monitors
+        // go blind at once, others after BLIND_AFTER empty captures, not before the window
+        // settled (a player that just started can be black). Logged once per window once it
+        // settled, and when it goes blind.
+        let mut blinded = false;
+        for (hwnd, reason, copied) in empty {
+            let never = reason == live_wallpaper::NOT_REDIRECTED;
+            let mut report = None;
+            for live in self.live.iter_mut().filter(|l| l.hwnd == hwnd) {
+                let settled = never || live.since.elapsed() >= LIVE_SETTLE;
+                let mut now_blind = false;
+                if !copied {
+                    live.empty += 1;
+                    now_blind = !live.blind && settled && (never || live.empty >= BLIND_AFTER);
+                }
+                if !settled {
+                    continue;
+                }
+                if now_blind {
+                    live.blind = true;
+                    live.image = None;
+                    blinded = true;
+                }
+                if live.reported != Some(hwnd) || now_blind {
+                    live.reported = Some(hwnd);
+                    report = Some((live.monitor, live.blind));
+                }
+            }
+            let Some((monitor, blind)) = report else {
+                continue;
+            };
+            let class = desktop::class_name(HWND(hwnd as *mut core::ffi::c_void));
+            if copied {
+                tracing::info!(?monitor, %class, reason, "live wallpaper capture came back empty; showing the window it clones");
+            } else if blind {
+                tracing::info!(?monitor, %class, reason, "live wallpaper cannot be captured; its backdrop shows a neutral colour");
+            } else {
+                tracing::info!(?monitor, %class, reason, "live wallpaper capture came back empty; the backdrop keeps its last picture");
+            }
+        }
+        let mut captured = 0;
+        for (recipe, hwnd, _) in &built {
+            if let Some(hwnd) = *hwnd
+                && let Some(live) = self
+                    .live
+                    .iter_mut()
+                    .find(|l| l.monitor == recipe.rect() && l.hwnd == hwnd)
+            {
+                live.image = recipe.live.clone();
+                live.empty = 0;
+                live.blind = false;
+                captured += 1;
+            }
+        }
+        tracing::debug!(
+            captured,
+            blinded,
+            elapsed_ms = job.started.elapsed().as_millis(),
+            "live wallpaper captured"
+        );
+        if captured == 0 && !blinded {
+            return;
+        }
+        // The worker built these monitors from their old captures: build again.
+        if blinded
+            || self.wallpaper_sig != job.shown
+            || self.wallpaper_cache.generation() != job.generation
+            || job.snapshot.signature() != job.file_signature
+        {
+            self.wallpaper_sig = None;
+            self.check_wallpaper("live wallpaper");
+            return;
+        }
+        let liquid_glass = self.ctx.theme.borrow().liquid_glass;
+        let set: Vec<MonitorBackdrop> = built
+            .into_iter()
+            .map(|(recipe, _, image)| recipe.finish(image, liquid_glass))
+            .collect();
+        let backdrops = Rc::new(BackdropSets {
+            acrylic: Rc::new(set),
+            unreadable: unreadable_monitors(&self.live),
+        });
+        self.wallpaper_sig = Some(backdrop_signature(&job.snapshot, &self.live));
+        *self.ctx.backdrops.borrow_mut() = backdrops.clone();
+        for window in self.fences.values() {
+            window.set_backdrops(backdrops.clone());
+        }
+        self.tell_live_wallpaper();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_tells_each_monitor_s_live_wallpaper_state() {
+        let monitor = |left| RECT {
+            left,
+            top: 0,
+            right: left + 1920,
+            bottom: 1080,
+        };
+        let entry = |left, image: Option<Arc<Image>>, blind| LiveWallpaper {
+            monitor: monitor(left),
+            hwnd: 1,
+            since: Instant::now(),
+            missing: None,
+            image,
+            attempted: None,
+            reported: None,
+            empty: 0,
+            blind,
+        };
+        let live = [
+            entry(0, Some(Arc::new(Image::solid(4, 4, [9, 9, 9]))), false),
+            entry(1920, None, true),
+            entry(3840, None, false),
+        ];
+        assert_eq!(live_wallpaper_state(&live, monitor(0)), "captured");
+        assert_eq!(live_wallpaper_state(&live, monitor(1920)), "notCapturable");
+        assert_eq!(live_wallpaper_state(&live, monitor(3840)), "pending");
+        assert_eq!(live_wallpaper_state(&live, monitor(-1920)), "none");
+    }
+
+    #[test]
+    fn the_card_counts_only_fences_that_show_the_pane() {
+        // 默认 and 更透明 show the see-through pane.
+        assert!(shows_pane(None, false));
+        assert!(shows_pane(Some(1.0), false));
+        assert!(shows_pane(Some(0.55), false));
+        // 全透明 has no plate, 更厚实 stays opaque, the fence arranged like the desktop has
+        // no plate at any opacity.
+        assert!(!shows_pane(Some(0.0), false));
+        assert!(!shows_pane(Some(1.6), false));
+        assert!(!shows_pane(None, true));
+        assert!(!shows_pane(Some(0.55), true));
+    }
+
+    #[test]
+    fn the_card_is_outdated_once_its_reason_is_gone() {
+        let entry = |blind, missing: bool| LiveWallpaper {
+            monitor: RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            hwnd: 1,
+            since: Instant::now(),
+            missing: missing.then(Instant::now),
+            image: None,
+            attempted: None,
+            reported: None,
+            empty: 0,
+            blind,
+        };
+        // Liquid Glass over a player whose picture cannot be read: the card holds, also in
+        // the moment a player's window is missing between two wallpapers.
+        assert_eq!(live_card_outdated(true, &[entry(true, false)]), None);
+        assert_eq!(live_card_outdated(true, &[entry(true, true)]), None);
+        assert_eq!(
+            live_card_outdated(true, &[entry(false, false), entry(true, false)]),
+            None
+        );
+        // The user chose Fluent; the player ended; its picture can be read now.
+        assert_eq!(
+            live_card_outdated(false, &[entry(true, false)]),
+            Some("the look is Fluent")
+        );
+        assert_eq!(live_card_outdated(true, &[]), Some("the player ended"));
+        assert_eq!(
+            live_card_outdated(true, &[entry(false, false)]),
+            Some("the wallpaper can be read")
+        );
+    }
+
+    #[test]
+    fn the_card_names_the_players_users_know() {
+        let exe = |p: &'static str| Some(Path::new(p));
+        // Wallpaper Engine: its scene window, a clone window, either program file.
+        for (class, path) in [
+            (
+                "WPEDesktopDX11Window",
+                r"C:\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe",
+            ),
+            (
+                "WPECloneView",
+                r"C:\Steam\steamapps\common\wallpaper_engine\wallpaper32.exe",
+            ),
+            ("Other", r"D:\wallpaper_engine\wallpaper64.exe"),
+        ] {
+            assert_eq!(player_name(class, exe(path)), Some("Wallpaper Engine"));
+        }
+        assert_eq!(
+            player_name("WPEDesktopDX11Window", None),
+            Some("Wallpaper Engine")
+        );
+        // Lively: mpv and its own players run from its folder.
+        let lively = r"C:\Program Files\WindowsApps\12030rocksdanister.LivelyWallpaper_2.1\Build\plugins\mpv\mpv.exe";
+        assert_eq!(player_name("mpv", exe(lively)), Some("Lively Wallpaper"));
+        // Its installer's folder, and its own program files wherever they are.
+        for path in [
+            r"C:\Program Files\Lively Wallpaper\plugins\mpv\mpv.exe",
+            r"C:\Users\me\AppData\Local\Programs\Lively Wallpaper\plugins\cef\Lively.Player.CefSharp.exe",
+            r"D:\Portable\lively\plugins\webview2\Lively.Player.WebView2.exe",
+            r"D:\Portable\lively\Lively.exe",
+            r"D:\Portable\old\livelywpf.exe",
+        ] {
+            assert_eq!(
+                player_name("Other", exe(path)),
+                Some("Lively Wallpaper"),
+                "{path}"
+            );
+        }
+        // Any other player has no name: the card says 动态壁纸.
+        assert_eq!(
+            player_name("PfLiveStandIn", exe(r"C:\pf\run\standin.exe")),
+            None
+        );
+        assert_eq!(player_name("mpv", exe(r"C:\Tools\mpv\mpv.exe")), None);
+        // Look-alikes: other programs called wallpaper..., a Windows user or a folder called
+        // lively, a program whose name only begins like Lively's.
+        for path in [
+            r"C:\Program Files\WallpaperTool\wallpaper.exe",
+            r"C:\Tools\wallpaperchanger.exe",
+            r"C:\Tools\wallpaper64helper.exe",
+            r"C:\Users\lively\Tools\mpv\mpv.exe",
+            r"C:\Users\lively\AppData\Local\Other\player.exe",
+            r"D:\lively\mpv.exe",
+            r"C:\Tools\livelyhood.exe",
+        ] {
+            assert_eq!(player_name("Other", exe(path)), None, "{path}");
+        }
+    }
+}

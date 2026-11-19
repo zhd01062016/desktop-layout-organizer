@@ -1,0 +1,17 @@
+name: Windows build
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: powershell
+        working-directory: 工程
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build screenshot tool and installer
+        run: .\Build-Managed.ps1
+      - name: Build desktop application
+        run: .\Build-Native.ps1

@@ -1,0 +1,1067 @@
+//! `FenceViewState`: everything one fence window knows about itself, plus its smallest accessors.
+
+use super::*;
+
+/// 像桌面一样排列: where the fence arranges its icons (screen px).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesktopArea {
+    /// The monitor's work area.
+    pub work: RECT,
+    /// Other fences' rects: cells under them stay free.
+    pub covered: Vec<RECT>,
+    /// 自由摆放: the saved grid cell `[column, row]` of each icon (the fence's
+    /// `desktop_cells`); None = the icons stand down the columns in their order.
+    pub free: Option<BTreeMap<ItemId, [u16; 2]>>,
+    /// 自由摆放 with no saved cells yet: where Windows' own desktop has the icons, so they keep
+    /// those places (#204). Icons with a saved cell keep theirs.
+    pub windows: Option<WindowsIconPlaces>,
+}
+
+/// Windows' own desktop icons, as Explorer's desktop view had them when PecoFence read it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowsIconPlaces {
+    /// The spacing of Windows' icon grid as Explorer reports it (px at `explorer_dpi`).
+    pub spacing: (i32, i32),
+    /// The scale Explorer started at, which its reported spacing stays in.
+    pub explorer_dpi: Option<u32>,
+    /// The top-left of each icon's place on Windows' desktop (screen px).
+    pub places: BTreeMap<ItemId, (i32, i32)>,
+}
+
+impl WindowsIconPlaces {
+    /// Windows' grid spacing in px on a monitor at `scale` (its DPI / 96): Explorer reports it
+    /// in the scale it started at, while the icons stand at the monitor's scale.
+    pub fn spacing_at(&self, scale: f32) -> (i32, i32) {
+        let k = self
+            .explorer_dpi
+            .filter(|d| *d > 0)
+            .map_or(1.0, |d| scale * 96.0 / d as f32);
+        (
+            (self.spacing.0 as f32 * k).round() as i32,
+            (self.spacing.1 as f32 * k).round() as i32,
+        )
+    }
+}
+
+/// A window on its way from `from` to `to` (screen px of its top-left corner); `t` runs 0 to 1.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WindowGlide {
+    pub(super) from: (i32, i32),
+    pub(super) to: (i32, i32),
+    pub(super) t: Tween,
+    /// The glide's own time and curve: its clock starts again with its first frame.
+    pub(super) time: Duration,
+    pub(super) curve: Curve,
+    /// Its first frame has run (`tick_glide` starts `t` there).
+    pub(super) begun: bool,
+    /// The app hears the new bounds when the window has arrived (a fence the user dropped);
+    /// false for a place the app itself chose and has recorded (a display change).
+    pub(super) notify: bool,
+}
+
+impl WindowGlide {
+    /// The first frame of the glide: its clock starts at `now`, with the time and the curve
+    /// it was asked for (a display change: a quarter of a second, point to point; it ran
+    /// 167 ms decelerating, the landing glide's values). True the first time.
+    pub(super) fn begin(&mut self, now: Instant) -> bool {
+        if std::mem::replace(&mut self.begun, true) {
+            return false;
+        }
+        self.t = Tween::new(0.0, 1.0, self.time, self.curve, now);
+        true
+    }
+
+    /// Where the window is at `now`, and whether it has arrived.
+    pub(super) fn at(&self, now: Instant) -> ((i32, i32), bool) {
+        if self.t.is_done(now) {
+            return (self.to, true);
+        }
+        let p = self.t.value_at(now);
+        let along = |a: i32, b: i32| a + ((b - a) as f32 * p).round() as i32;
+        (
+            (along(self.from.0, self.to.0), along(self.from.1, self.to.1)),
+            false,
+        )
+    }
+}
+
+/// A press the lock of a locked fence refuses to turn into a move or a resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LockPress {
+    /// Screen point of the press.
+    pub(super) at: (i32, i32),
+    /// The press also began a selection rectangle (an edge band over empty content, where an
+    /// unlocked fence resizes): only a drag that leaves the fence, as a resize outward would,
+    /// counts as refused. A drag inward selects icons and is no business of the lock.
+    pub(super) leave_only: bool,
+}
+
+pub struct FenceViewState {
+    pub fence_id: FenceId,
+    pub title: String,
+    pub rolled_up: bool,
+    pub is_inbox: bool,
+    /// Expanded window height in physical pixels (restored when un-rolling).
+    pub expanded_h_px: i32,
+    pub icon_size: u32,
+    pub label_lines: u8,
+    pub items: Vec<ItemView>,
+    /// Tabs shown in the title row (the host itself first). One entry = plain title.
+    pub(super) tabs: Vec<TabView>,
+    /// The fence whose items are displayed (a tab id, or the host's own id).
+    pub(super) active: FenceId,
+    pub(super) tab_hover: Option<usize>,
+    pub(super) tab_drag: Option<TabDrag>,
+    /// Tab pills sliding to their slots after a reorder (drag past a neighbour, 左移 / 右移,
+    /// cancel): 167 ms point-to-point, keyed by tab id so a strip refresh cannot desync them.
+    pub(super) tab_slide: Vec<(FenceId, Tween)>,
+    /// The just-released dragged pill settling from the pointer into its slot (167 ms).
+    pub(super) tab_settle: Option<(FenceId, Tween)>,
+    /// Slot a fence being dragged over this title would be inserted at (drag-to-merge onto a
+    /// tabbed strip): the strip opens a `TAB_MERGE_GAP_W` gap there and the neighbours slide
+    /// aside. None = no hint, or a plain (single-tab) title.
+    pub(super) merge_gap: Option<usize>,
+    /// Natural pill widths by caption (folder glyph and search badge), see `tab_natural_widths`.
+    pub(super) tab_natural_w: RefCell<Vec<(String, u8, bool, (bool, bool), Option<String>, f32)>>,
+    /// How far (DIPs) a title-row strip too wide for its room is scrolled, see `tab_rects`.
+    pub(super) tab_scroll: Cell<f32>,
+    /// Last frame of the strip's edge auto-scroll (`tab_strip_autoscroll`); None while idle.
+    pub(super) tab_edge_last: Option<Instant>,
+    /// Screen point of a fence dragged over this title to merge (the insertion gap follows it).
+    pub(super) merge_pointer: Option<(i32, i32)>,
+    /// Tab head under an OLE drag (highlighted like a folder drop target; not the hover).
+    pub(super) drop_tab: Option<usize>,
+    /// Drag dwell timer: the rolled-fence unroll is armed.
+    pub(super) drag_peek_armed: bool,
+    /// Client point of a plain right button press, which took the capture: the release opens a
+    /// menu only when it pairs with one here and the pointer stayed on it (a right drag that
+    /// starts on an icon becomes the shell drag and takes this, one from anywhere else opens
+    /// nothing, and a cancel press records none).
+    pub(super) rbutton_press: Option<(i32, i32)>,
+    /// Item whose inline rename edit is open: its label stays folded under the edit box.
+    pub(super) renaming: Option<ItemId>,
+    /// The fence-title rename popup is open (a hover peek stays expanded under it).
+    pub(super) title_renaming: bool,
+    /// A fence just made: when its name box was asked for. The box opens when the fade-in
+    /// running then has ended (`rename_after_fade_in`).
+    pub(super) rename_after_fade: Option<Instant>,
+    /// The anchor item's unfolded label, cached by (item, cell width, name) so a content redraw
+    /// (hover fade, scroll glide, marquee) does not lay the text out again.
+    pub(super) unfold_cache: Option<UnfoldCache>,
+    /// The details view's type names by extension, asked from the shell as rows come near the
+    /// viewport (`ensure_texts`); emptied with every new item list (`replace_items`).
+    pub(super) type_names: pecofence_platform::fileinfo::TypeNames,
+    /// Every item has its fitted name (and, in the details view, its column texts): the
+    /// fitting ahead has nothing left and its timer is off. Cleared wherever names are dropped
+    /// or the list changes.
+    pub(super) fit_ahead_done: bool,
+    /// When the user last pressed a key or used the mouse, as of the last content draw or
+    /// piece (`sysparams::last_input_tick`): a later input puts the next piece off.
+    pub(super) fit_ahead_input: Option<u32>,
+    /// How often in a row a piece was put off (`FIT_AHEAD_WAITS`).
+    pub(super) fit_ahead_waits: u8,
+    /// The last content draw kept the scrollbar's strip clear (the fence scrolled): only for
+    /// the debug line when that changes.
+    pub(super) strip_kept: bool,
+    /// A tab was just torn off; the App will hand us the new window to drag.
+    pub(super) detach_pending: bool,
+    pub(super) detach_cancelled: bool,
+    pub(super) remote_drag: Option<RemoteDrag>,
+    /// Title decorations of the fence being shown: the portal's folder glyph and up button, the
+    /// Task View glyph of a window bound to virtual desktops.
+    pub(super) deco: TitleDeco,
+    /// The infotip of the Task View glyph (the desktops it shows on), `None` while it shows on
+    /// every desktop.
+    pub(super) desktop_tip: Option<String>,
+    pub(super) up_hovered: bool,
+    pub(super) chevron_hovered: bool,
+    /// Control the mouse button is held on, and whether the pointer is still over it (Win32
+    /// button semantics: the pressed fill hides when you drag off and returns when you come
+    /// back; release outside cancels).
+    pub(super) pressed: Option<PressTarget>,
+    pub(super) press_inside: bool,
+    /// Client point of the press (a chevron press dragged past the threshold becomes a title
+    /// drag, so the right end of the title row still moves the fence).
+    pub(super) press_origin: (i32, i32),
+    /// Keyboard focus ring shown on the cursor item (after keyboard navigation, until a mouse
+    /// click or focus loss).
+    pub(super) focus_visible: bool,
+    /// This fence (or its rename popup) is the active window: selection draws in the accent;
+    /// otherwise in neutral grey (Explorer LISS_SELECTEDNOTFOCUS), cross-faded over 167 ms.
+    pub(super) win_active: bool,
+    pub(super) selection_inactive: Tween,
+    /// 1 while a drag from elsewhere hovers the fence (own selection greys out so only the
+    /// drop target reads accent), 83 ms both ways like the other drop feedback.
+    pub(super) drop_inactive: Tween,
+    /// Draw-side state fades (WinUI 83 ms brush transitions), synced from the logical
+    /// hover / selection / header fields at draw time and sampled while painting. Keyed by
+    /// item id so a refresh that moves an item (sort, reorder drop, watcher reconcile) carries
+    /// its fade with it instead of leaving it on the index.
+    pub(super) item_hover: Fades<ItemId>,
+    pub(super) item_sel: Fades<ItemId>,
+    pub(super) header_fades: Fades<HeaderColumn>,
+    pub(super) chrome_fades: Fades<ChromeKey>,
+    /// Drop-target fade per item (a folder under a drag), 83 ms both ways.
+    pub(super) drop_fades: Fades<ItemId>,
+    /// Peek search marks (None = no search) and the per-item dimming they fade (83 ms).
+    pub(super) search: Option<SearchMarks>,
+    /// The hover, drop target, drag and animation state the search fades of every item were
+    /// last set for (`item_alphas`); None when the marks or the item list changed since.
+    pub(super) search_fades_for: Option<(Option<usize>, Option<usize>, bool, bool)>,
+    pub(super) search_dim: Fades<ItemId>,
+    /// A Peek search holds this fence open (a hover peek that does not close until the search
+    /// has no matches here any more).
+    pub(super) search_expanded: bool,
+    /// Where a Peek search scrolled this fence, per tab it scrolled (it may switch tabs): the
+    /// offset before the search first moved that tab and the offset the search last put it
+    /// at. When the search ends each goes back there, unless the user scrolled it meanwhile:
+    /// the tab on show glides, a tab that is not on show gets it into `scroll_memory`. The
+    /// search is a temporary view: the tabs it switched and the fences it expanded go back too.
+    pub(super) search_scroll: HashMap<FenceId, (f32, f32)>,
+    /// Fence-wide drop wash + ring alpha (83 ms in, 167 ms out).
+    pub(super) drop_wash: Tween,
+    /// Insertion caret alpha (83 ms) and the slot it is (still) drawn at while fading out.
+    pub(super) caret_alpha: Tween,
+    pub(super) caret_shown: Option<usize>,
+    /// Drag-to-merge title highlight: logical state and its alpha (83 ms in, 167 ms out).
+    pub(super) merge_hint: bool,
+    pub(super) merge_t: Tween,
+    /// Layout motion: items gliding to new cells / fading in, and removed items fading out.
+    pub(super) item_motion: HashMap<ItemId, ItemMotion>,
+    /// When an edge drag last changed the column count (`reflow_items`): a change that
+    /// follows within the glide's time places the icons at once.
+    pub(super) column_change_at: Option<Instant>,
+    pub(super) leaving: Vec<LeavingItem>,
+    /// The filter box changed the filter: when the next `replace_items` brings a whole new
+    /// list (a refill, not a rearrangement), it cross-fades instead of cutting.
+    pub(super) fade_next_refill: bool,
+    /// Icons of our own just let go on this fence: when, and where the centre of each one's
+    /// drag picture was (unscrolled content DIPs). The next list refresh starts them there.
+    pub(super) drop_landing: Option<(Instant, HashMap<ItemId, (f32, f32)>)>,
+    /// A fade was still running when the surface was last drawn: `tick` redraws it.
+    pub(super) content_busy: bool,
+    pub(super) chrome_busy: bool,
+    /// Mouse is somewhere over the window (title or content) — drives title-on-hover and the
+    /// inactive-scrollbar rule.
+    pub(super) mouse_inside: bool,
+    /// Last scroll / scrollbar activity, for the inactive-scrollbar linger.
+    pub(super) last_scroll: Option<Instant>,
+    /// A rolled title was pressed with click-to-expand on; released without dragging = expand.
+    pub(super) click_pending: Option<(i32, i32)>,
+    /// The last title click expanded the fence (click-to-expand); a WM_NCLBUTTONDBLCLK that
+    /// completes it must not roll the fence back up.
+    pub(super) suppress_dblclk: bool,
+    /// Double-click on a folder item navigates inside the portal instead of launching it.
+    pub(super) navigate_folders: bool,
+    /// The folder the shown fence's drops land in when it is a portal (its current folder).
+    pub(super) portal_folder: Option<PathBuf>,
+    /// Icons grid, compact list or details rows (FenceView.layout).
+    pub(super) layout: ViewLayout,
+    /// Current sort, for the details header indicator.
+    pub(super) sort: SortMode,
+    pub(super) sort_reverse: bool,
+    /// Items sit under 今天 / 昨天 / … section headers (FenceView.group_by_date).
+    pub(super) group_by_date: bool,
+    pub(super) header_hover: Option<DetailColumn>,
+    /// Details column widths (修改日期, 类型, 大小) in DIPs.
+    pub(super) column_widths: [f32; 3],
+    /// Details columns shown (header context menu).
+    pub(super) columns_visible: [bool; 3],
+    pub(super) col_drag: Option<ColDrag>,
+    /// The fence shown is a folder portal (sort-only: no manual arrangement).
+    pub(super) is_portal: bool,
+    /// 便签与待办: the fence shown is a note with this text, drawn in place of items (None =
+    /// it shows items).
+    pub(super) note: Option<String>,
+    /// The note is being edited: what its editor holds, drawn in place of `note`.
+    pub(super) note_edit: Option<NoteEditView>,
+    /// A press in the edited note's text is held: moving the pointer selects.
+    pub(super) note_drag: bool,
+    /// The press held on a to-do of a note that is not being edited: a click on its
+    /// release, or the line follows the pointer to another place (`TodoDrag`).
+    pub(super) todo_drag: Option<TodoDrag>,
+    /// Lines of the note on their way to their places after a to-do moved: the line and the
+    /// top it is drawn at (content DIPs before scrolling; 167 ms).
+    pub(super) note_slide: Vec<(usize, Tween)>,
+    /// The line drawn lifted and how much of its plate shows: it comes while the to-do is
+    /// dragged and goes while the released line settles.
+    pub(super) note_lift: Option<(usize, Tween)>,
+    /// The note's to-do check boxes as last drawn: line index and (left, top, right, bottom)
+    /// in content DIPs.
+    pub(super) note_boxes: Vec<(usize, [f32; 4])>,
+    /// The note's web addresses as last drawn (none while it is edited): the line, the
+    /// address's start in the line's text (UTF-16 units), and one box (left, top, right,
+    /// bottom) in content DIPs per line on screen the address runs over.
+    pub(super) note_links: Vec<(usize, usize, [f32; 4])>,
+    /// 时钟与日期: the fence shown is a clock; true = with seconds. None = it shows items.
+    pub(super) clock: Option<bool>,
+    /// The clock's time and date text sizes (DIPs) as last drawn, and as last logged.
+    pub(super) clock_text: (f32, f32),
+    pub(super) clock_text_logged: (f32, f32),
+    /// The clock's date line as last drawn: "long", "short" (no year, the short weekday) or
+    /// "none", by what fits the width.
+    pub(super) clock_date: &'static str,
+    /// The clock's time as last drawn: "full", or "short" (without its seconds, which did not
+    /// fit the width at the smallest size).
+    pub(super) clock_time: &'static str,
+    /// 文字大小 of a note or script fence: 0 small, 1 normal, 2 large, 3 extra large.
+    pub(super) text_size: u8,
+    /// A note's or a script fence's text as last measured (`take_tool_extent`): the height
+    /// its content scrolls over (0 while it shows its hint, or items), the top of each line
+    /// of text from the first one's (the content rests on one of them) and one wheel line.
+    pub(super) tool_text_h: f32,
+    pub(super) tool_line_tops: Vec<f32>,
+    pub(super) tool_line_step: f32,
+    /// 脚本栅栏: the fence shown is a script fence with this output and footer.
+    pub(super) script: Option<ScriptView>,
+    /// Its clickable rows as last drawn: row index and (left, top, right, bottom) in content
+    /// DIPs.
+    pub(super) script_rows: Vec<(usize, [f32; 4])>,
+    /// The clickable row under the pointer.
+    pub(super) script_hover: Option<usize>,
+    /// The hover plates of its rows fading in and out, by row index (as `item_hover`).
+    pub(super) script_fades: Fades<usize>,
+    /// Which form of the footer was drawn last (`FenceChrome::script_footer`), for the log.
+    pub(super) script_footer_form: &'static str,
+    /// 便签与待办: the line whose check box is under the pointer.
+    pub(super) note_box_hover: Option<usize>,
+    /// 便签与待办: the web address under the pointer (its line and start).
+    pub(super) note_link_hover: Option<(usize, usize)>,
+    /// The portal's folder could not be found (its empty state says so).
+    pub(super) portal_missing: bool,
+    /// The empty-state text in place of the usual one (a smart fence's state, a filter that
+    /// matches nothing), and a smart fence's count in its capsule at the right ("6"; see
+    /// `FenceWindow::set_status_view`).
+    pub(super) empty_override: Option<&'static str>,
+    /// The label of a clickable row under that text (`set_status_view`: a smart fence
+    /// that needs Everything offers to start or install it).
+    pub(super) empty_action: Option<&'static str>,
+    /// The pointer is over that row.
+    pub(super) empty_action_hover: bool,
+    pub(super) title_count: Option<String>,
+    /// What the count capsule's infotip says (`FenceWindow::set_count_tip`): a count with a
+    /// "+" shows the newest files only, and this says of how many. None: no infotip.
+    pub(super) count_tip: Option<String>,
+    /// 筛选: the fence is filtered right now (Esc clears it).
+    pub(super) filter_active: bool,
+    /// 筛选: the tag of a filtered single title once its box closed: the type (「类型：PDF」, or
+    /// empty), the text and the count (empty when the count capsule shows it).
+    pub(super) filter_tag: Option<(String, String, String)>,
+    /// 智能栅栏: the fence shows a search, so nothing is dropped into it.
+    pub(super) refuses_drops: bool,
+    /// Width the cached labels were fitted for; a change invalidates them.
+    pub(super) label_w: f32,
+    /// The wider box an icon's name may take (`ensure_icons_and_labels`); `label_w` without one.
+    pub(super) label_wide_w: f32,
+    /// An item near the viewport was still waiting for its icon at the last content draw
+    /// (`ensure_icons_and_labels`): a delivered batch then redraws this window.
+    pub(super) icons_pending: bool,
+    /// Height (DIPs) of the content when the fence was last drawn empty: the text of an
+    /// empty fence stays where it stood then while it fades out under arriving icons.
+    pub(super) empty_text_h: Option<f32>,
+    pub(super) hover: Option<usize>,
+    pub(super) title_hover: bool,
+    pub(super) selected: HashSet<usize>,
+    /// Scroll offset in DIPs as drawn and hit-tested; while `scroll_anim` runs it is the
+    /// animated value (WinUI ScrollPresenter: wheel, keyboard and paging glide, thumb drags and
+    /// auto-scroll write it directly).
+    pub(super) scroll_y: f32,
+    /// Last scroll offset per tab of this window (session only, like Explorer): switching
+    /// away and back restores where that tab was.
+    pub(super) scroll_memory: HashMap<FenceId, f32>,
+    /// Offset to re-apply once the new tab's items have arrived (`set_items`); `set_grid`
+    /// consumes it, so a tab switch whose tabs differ in layout keeps the restored offset.
+    pub(super) scroll_restore: Option<f32>,
+    /// Portal 上一级: the folder just left, which the parent's `set_items` selects and scrolls
+    /// into view (Explorer), with the focus ring if it was showing.
+    pub(super) select_after_nav: Option<(ItemId, bool)>,
+    /// Ctrl+Tab asked for the tab switch under way: once the new tab's icons are here, the
+    /// first one in view takes the selection and the focus mark (`focus_after_tab_keys`).
+    pub(super) tab_switch_by_keys: bool,
+    /// The folder shown changed by keys with no icon to select (Enter into a subfolder,
+    /// Alt+Right): the first icon of the folder that arrives takes the focus mark.
+    pub(super) focus_first_after_nav: bool,
+    /// The user's own Delete (key or menu) of some items is under way (see `UserDelete`). When
+    /// the focused item goes with them, the item that followed it takes the focus and the
+    /// selection (`focus_after_delete`).
+    pub(super) user_delete: Option<UserDelete>,
+    /// Smooth-scroll client tween (the offset is rasterised into the D2D content surface, so
+    /// the surface is redrawn per frame from `tick`). Its target is where pending input
+    /// accumulates: a second wheel notch retargets from the anticipated end, not from the
+    /// current frame.
+    pub(super) scroll_anim: Option<ScrollGlide>,
+    pub(super) dpi: u32,
+    pub(super) theme: Theme,
+    /// Last contrast choice for a clear plate; interior mutability keeps the draw API read-only.
+    pub(super) glass_dark_text: Cell<Option<bool>>,
+    /// Fluent: whether the text had the halo when it was last picked (it keeps its state near
+    /// its threshold, like the colour). Reset with `glass_dark_text`.
+    pub(super) plate_halo: Cell<bool>,
+    /// Last contrast choice of a fully transparent fence for the bare wallpaper (its plate
+    /// hidden); `glass_dark_text` keeps the one for its plate. Reset with it.
+    pub(super) bare_dark_text: Cell<Option<bool>>,
+    /// The text colour and halo the content was last drawn with (`Theme::label_look`): a
+    /// fully transparent fence draws its content again when its plate comes or goes and the
+    /// pick changes (`redraw_chrome_only`).
+    pub(super) content_look: Cell<Option<(ColorF, bool, ColorF)>>,
+    pub(super) backdrops: Rc<BackdropSets>,
+    pub(super) backdrop_crop: Option<Image>,
+    /// Screen rect (left, top, width, height) `backdrop_crop` was cut for. While the height
+    /// animates the crop covers the taller end, so the per-frame chrome draws reuse it.
+    pub(super) backdrop_rect: Option<(i32, i32, i32, i32)>,
+    /// A drag moved the window without redrawing the backdrop for its new place
+    /// (`Behavior::defer_backdrop`): the next frame does.
+    pub(super) backdrop_stale: bool,
+    /// Acrylic: `MonitorBackdrop::crop_origin` of `backdrop_crop` (a move within one texel of
+    /// the quarter-size image cuts the same pixels).
+    pub(super) backdrop_origin: Option<(i32, i32, i32, i32)>,
+    /// `BitmapCache` key of the uploaded crop (per window; dropped whenever the crop changes).
+    pub(super) backdrop_key: String,
+    pub(super) gpu_glass: RefCell<pecofence_render::gpu_glass::GpuGlass>,
+    pub(super) chrome_panel: Panel,
+    pub(super) content_panel: Panel,
+    /// Device px from the window's top-left corner to the content panel as last laid out
+    /// (`layout_panels`, `sync_rail`): the left tab column's width (0 without one) and the
+    /// title row's height (0 beside a left tab column). Client points become content points by
+    /// subtracting them.
+    pub(super) content_x: i32,
+    pub(super) content_y: i32,
+    /// The left tab column's width in DIPs as last measured (`sync_rail`).
+    pub(super) rail_dip: f32,
+    /// Expanded window width (device px): what a fence collapsed to its left tab column
+    /// returns to, and the width the layout records for it.
+    pub(super) expanded_w_px: i32,
+    /// The window is collapsed (or collapsing) to its left tab column: it is as narrow as the
+    /// column, and `expanded_w_px` keeps its width.
+    pub(super) column_collapsed: bool,
+    pub(super) _target: DesktopWindowTarget,
+    /// Root of the window's visual tree: whole-window fades / scales animate this.
+    pub(super) root: ContainerVisual,
+    pub(super) chrome: Rc<FenceChrome>,
+    pub(super) icons: Rc<RefCell<IconCache>>,
+    pub(super) bitmaps: Rc<RefCell<BitmapCache>>,
+    pub(super) queue: CommandQueue,
+    pub(super) drag: Option<DragState>,
+    /// An OLE drag started from this window is running: hover is suppressed, the selection keeps
+    /// its normal look (Explorer leaves the source drawn as is; the shell drag image is the only
+    /// feedback).
+    pub(super) ole_drag: bool,
+    /// Client-pixel point of the press that became the OLE drag: the drag image lifts off
+    /// from there (the pointer has already moved past the drag threshold when the shell asks
+    /// for the image, see `render_drag_image`).
+    pub(super) ole_drag_press: (i32, i32),
+    pub(super) marquee: Option<MarqueeState>,
+    /// Folder item highlighted as the drop target of a running drag.
+    pub(super) drop_item: Option<usize>,
+    /// Insertion caret index while an internal drag reorders this fence.
+    pub(super) drop_insert: Option<usize>,
+    pub(super) scroll_drag: Option<ScrollDrag>,
+    /// Track segment pressed and held: pages again at the keyboard-repeat cadence until the
+    /// thumb reaches the pointer (TIMER_SCROLL_REPEAT).
+    pub(super) page_repeat: Option<ScrollHit>,
+    /// Pointer inside the scrollbar hot zone (the 12 DIP strip); the thumb widens 0.4 s later.
+    pub(super) scrollbar_hot: bool,
+    /// Thumb width 2..=6 DIP (167 ms decelerate after the expand / contract delays).
+    pub(super) sb_width: Tween,
+    /// Thumb opacity 0..=1 (83 ms linear; always 1 unless the inactive-scrollbar rule hides it).
+    pub(super) sb_alpha: Tween,
+    /// The last list change made the content scroll with icons that fade in: the bar is drawn
+    /// at their strength until they are in.
+    pub(super) sb_arrives: bool,
+    /// Track fill + arrow buttons reveal 0..=1 (83 ms linear with the expand / contract).
+    pub(super) sb_parts: Tween,
+    /// PointerOver fades of the two arrow buttons (83 ms), keyed by `ArrowUp` / `ArrowDown`.
+    pub(super) sb_arrow_fades: Fades<ScrollHit>,
+    /// Scrollbar part under the pointer as of the last mouse message (None = off the bar).
+    pub(super) sb_pointer: Option<ScrollHit>,
+    /// A scrollbar tween was started: `tick` redraws the content until both have settled.
+    pub(super) sb_busy: bool,
+    /// OLE drag edge auto-scroll (see `DragScroll`).
+    pub(super) drag_scroll: Option<DragScroll>,
+    /// Type-to-select prefix and when it was last extended.
+    pub(super) type_ahead: String,
+    pub(super) type_ahead_at: Option<Instant>,
+    /// Slow-double-click rename armed for this item (TIMER_RENAME).
+    pub(super) pending_rename: Option<ItemId>,
+    pub(super) tip: Option<Tooltip>,
+    pub(super) tip_target: Option<TipTarget>,
+    pub(super) tip_shown: bool,
+    /// When a visible infotip was last hidden (fast re-show while sweeping between items).
+    pub(super) tip_hidden_at: Option<Instant>,
+    /// Client px where TIMER_TIP was armed and whether it is armed: like TME_HOVER the tip
+    /// shows only once the pointer has rested inside the SM_C[XY]MOUSEHOVER box for the delay.
+    pub(super) tip_anchor: (i32, i32),
+    pub(super) tip_armed: bool,
+    /// Screen px of the last mouse move the infotip logic took (`update_tip_target`). As in
+    /// comctl32, a move to the same point neither arms nor re-targets the tip: Windows sends
+    /// one after a click, when a window appears or when the content moves under a resting
+    /// pointer. A tip that a click, a key or the wheel hid comes back only when the pointer
+    /// really moves. Forgotten when the pointer leaves the window for another point
+    /// (`on_mouseleave`), so a pointer that comes back to the very point gets its tip.
+    pub(super) tip_move_at: Option<(i32, i32)>,
+    /// 自由摆放: the icons the user is moving by hand right now. The placing of their new
+    /// cells leaves them out of its glide (`glide_to_new_slots`): they arrive from where they
+    /// were let go (`land_moved_icons`), not from their old cells.
+    pub(super) hand_moved: Vec<ItemId>,
+    /// Items on the clipboard via 剪切 (drawn at half alpha like Explorer).
+    pub(super) cut: HashSet<ItemId>,
+    /// Ctrl+wheel accumulator (touchpads deliver fractional notches).
+    pub(super) wheel_zoom_accum: i32,
+    /// Wheel-over-tabs accumulator: one tab per whole notch (touchpads deliver fractions).
+    pub(super) wheel_tab_accum: i32,
+    /// The tab TIMER_TAB_HOVER will switch to while the pointer stays on it.
+    pub(super) tab_hover_switch: Option<usize>,
+    /// A hover switched a tab of this strip: the next tabs wait `TAB_HOVER_NEXT_MS` only.
+    pub(super) tab_hover_quick: bool,
+    /// When the pointer left the tabs while `tab_hover_quick` (`TAB_HOVER_NEXT_KEEP`).
+    pub(super) tab_strip_left: Option<Instant>,
+    /// The hover switch on its way followed another: its content is placed without the swap.
+    pub(super) tab_swap_at_once: bool,
+    /// That switch has placed its tab: the item list that follows stands at once
+    /// (`replace_items` takes this).
+    pub(super) place_next_items: bool,
+    /// Fence height follows the item grid (FenceView.auto_height).
+    pub(super) auto_height: bool,
+    /// The left tab column appeared or grew (a tab joined, a caption changed, 标签栏位置): the
+    /// next height pass lets a fence too short for it grow (`take_rail_growth_px`).
+    pub(super) rail_grow: bool,
+    /// Mouse move/resize disabled (menu "锁定位置和大小").
+    pub(super) locked: bool,
+    /// A left press on a locked fence where it would move or resize without the lock, and
+    /// that nothing else took (no scrollbar, icon, tab or button): a drag from there pulses
+    /// the lock glyph once (`note_lock_drag`).
+    pub(super) lock_press: Option<LockPress>,
+    /// When the lock glyph's pulse started (the lock refused a drag): its opacity dips to 0.4
+    /// and comes back within `LOCK_PULSE`.
+    pub(super) lock_pulse: Option<Instant>,
+    /// 向上展开: each expansion opens upward where the fence fits above its title row, else
+    /// downward (`clearance::expand_side`); the title row stays where the user put it.
+    pub(super) expand_upward: bool,
+    /// The title row is at the bottom: height changes (roll-up, expand, auto height) keep the
+    /// bottom edge in place. Set as a 向上展开 fence starts to expand, kept while it rolls back.
+    pub(super) row_bottom: bool,
+    /// The `row_bottom` the running height animation started with: it keeps moving that edge.
+    pub(super) anim_upward: bool,
+    /// Per-fence material override; None follows the global setting.
+    pub(super) backdrop_override: Option<BackdropMode>,
+    /// Per-fence opacity multiplier for the glass layer (1.0 = default).
+    pub(super) opacity: f32,
+    /// The view the fence asks for (`set_grid`): `layout` is the icon view while 像桌面一样
+    /// 排列 is on and this again when it goes off.
+    pub(super) wanted_layout: ViewLayout,
+    /// 像桌面一样排列 (`Fence::desktop_layout`): the work area this fence arranges its icons
+    /// in and the other fences' rects over it (screen px). Some = no title row, plate or
+    /// edges; the window covers only the cells its icons take.
+    pub(super) desktop: Option<DesktopArea>,
+    /// The cells of the items (and one more for a drop after the last), content-local DIPs,
+    /// from `arrange_desktop`.
+    pub(super) desktop_slots: Vec<CellRect>,
+    /// `replace_items` placed the cells of a new item list itself (the glide needs them) and
+    /// they moved: the next `arrange_desktop` reports that, so the window is fitted and drawn.
+    pub(super) desktop_slots_moved: bool,
+    /// 自由摆放: the grid the icons stand on and the cell (column, row) of each item, from
+    /// `arrange_desktop`; None while the icons are arranged in columns.
+    pub(super) desktop_free: Option<(super::desktop_layout::FreeGrid, Vec<(i32, i32)>)>,
+    /// 自由摆放: the icons the latest pass gave a cell other than their saved one (the app
+    /// saves them when it reads the note `arrange_desktop` sent).
+    pub(super) desktop_free_sent: Option<Vec<(ItemId, [u16; 2])>>,
+    /// The icons selected when a rectangle drawn on the desktop started (kept with Ctrl or
+    /// Shift); None while no rectangle is drawn.
+    pub(super) desktop_band_base: Option<HashSet<usize>>,
+    /// The (selected icon, icon count) the window's shape was last made for.
+    pub(super) desktop_shape_for: Option<(Option<(usize, u32)>, usize)>,
+    /// The shape `WM_APP_DESKTOP_SHAPE` applies.
+    pub(super) desktop_shape_pending: Option<Vec<RECT>>,
+    /// Per-fence title on hover; None follows `Behavior::title_on_hover`.
+    pub(super) title_on_hover_override: Option<bool>,
+    /// 鼠标移入时保持透明 (`AppearanceOverride::transparent_on_hover`); see `stays_clear`.
+    pub(super) transparent_on_hover: bool,
+    /// Per-fence colour wash / title colour / title size.
+    pub(super) style: FenceStyle,
+    /// Icon grid spacing in DIPs (FenceView.spacing).
+    pub(super) spacing: i32,
+    /// 图标对齐 of the icon grid (FenceView.icon_align).
+    pub(super) icon_align: IconAlign,
+    /// Keyboard/selection anchor: the last item clicked or moved to with the arrow keys.
+    pub(super) anchor_index: Option<usize>,
+    /// Start of a Shift range selection.
+    pub(super) range_anchor: Option<usize>,
+    /// A draw hit `DXGI_ERROR_DEVICE_REMOVED`; surfaces must be recreated (task 6).
+    pub(super) device_lost: bool,
+    pub(super) drop_hover: bool,
+    pub(super) roll_anim: Option<RollAnim>,
+    /// Roll progress 0 (expanded) ..= 1 (rolled), phase-locked with the roll's height tween
+    /// (same duration and curve): the chevron rotates with it instead of flipping at the end.
+    pub(super) roll_t: Tween,
+    /// Auto-height settle (250 ms point-to-point): the bottom edge glides to the fitting
+    /// height. Separate from `roll_anim` so it never blocks hover-peek or the chevron.
+    pub(super) height_anim: Option<Tween>,
+    /// An icon size step is giving the fence another height: once the fence has it (`land`),
+    /// the selected item is brought back into view (`FenceWindow::keep_selection_in_view`).
+    pub(super) reveal_after_height: bool,
+    /// Whole-window fade in progress and its generation (see `VisFade`).
+    pub(super) vis_fade: Option<VisFade>,
+    pub(super) vis_gen: usize,
+    pub(super) vis_deadline: Option<Instant>,
+    /// The Peek fades this fence with its dimmer (`peek_fade_prepare`): the root opacity and
+    /// the shadow's alpha are the Peek's until `peek_fade_rest`, or until a show / hide fade
+    /// takes them over.
+    pub(super) peek_faded: bool,
+    /// What the current whole-window fade did so far (see `FadeTrace`).
+    pub(super) fade_trace: FadeTrace,
+    /// `FenceWindow::retire` was called: the window is fading out for good and lives only in
+    /// `App::dying`. Nothing may show it again, and every hide must end in `FadeOutDone`.
+    pub(super) retired: bool,
+    /// The fence belongs to other virtual desktops than the current one (在哪个虚拟桌面显示):
+    /// it stays hidden, whoever asks to show it (quick hide, Peek, a new window).
+    pub(super) off_desktop: bool,
+    /// Outgoing content panels of tab switches, still fading out under the new panel (a
+    /// second switch mid-swap hands off from the current opacity instead of snapping, so more
+    /// than one can be in flight); all parked in `spares` when `WM_APP_TAB_SWAP_DONE` arrives
+    /// with the newest generation. At most two spares are kept.
+    pub(super) outgoing: Vec<Panel>,
+    pub(super) spares: Vec<Panel>,
+    pub(super) swap_gen: usize,
+    pub(super) swap_deadline: Option<Instant>,
+    /// Active-tab pill gliding to the newly selected tab: (x, w) in DIPs, 167 ms decelerate.
+    pub(super) pill_anim: Option<(Tween, Tween)>,
+    pub(super) stack: Rc<RenderStack>,
+    pub(super) motion: Rc<Motion>,
+    pub(super) frames: Rc<FrameClock>,
+    pub(super) hwnd: HWND,
+    pub(super) shadow: ShadowWindow,
+    /// When the shadow bitmap was last uploaded (throttle for interactive resizing).
+    pub(super) shadow_uploaded: Option<Instant>,
+    /// TIMER_SHADOW is waiting to bring the shadow up to date after a throttled size step.
+    pub(super) shadow_timer: bool,
+    /// What the last shadow bitmap for a new size cost to make and present.
+    pub(super) shadow_cost: Duration,
+    /// Constant alpha of the shadow window (0..=1), a client tween mirroring the root's
+    /// whole-window fade: a layered HWND has no compositor property, so `tick` re-issues the
+    /// cached shadow bitmap with the sampled alpha each frame while `shadow_fading`.
+    pub(super) shadow_alpha: Tween,
+    pub(super) shadow_fading: bool,
+    /// Title on hover: 1 = title row shown, 0 = folded away — the plate then starts at the
+    /// content, and its top edge glides up (167 ms decelerate) when the pointer arrives.
+    pub(super) title_reveal: Tween,
+    /// 全透明: 1 = plate shown, 0 = cleared (167 ms linear); always 1 for other opacities.
+    pub(super) plate_reveal: Tween,
+    /// Plate top inset (device px) and plate alpha as of the last chrome draw: the root clip
+    /// and the shadow follow them (`sync_plate_shape`).
+    pub(super) plate_inset_px: i32,
+    pub(super) plate_alpha: f32,
+    /// The window's top edge lies on the top edge of its monitor's work area (docked to the
+    /// top, or dragged there): the top corners of the plate and of its shadow are square
+    /// there and round again when the fence leaves (`sync_edge_top`).
+    pub(super) edge_top: bool,
+    /// Temporarily expanded by hovering a rolled fence (state stays "rolled" for persistence).
+    pub(super) peeking: bool,
+    /// A hover peek (or a file drag) opened it and raised it above the other fences
+    /// (`Command::RaiseForHover`): the roll-up that follows puts it back.
+    pub(super) hover_raised: bool,
+    /// Rolled up on request (the chevron, a title click, the menu, the CLI) with the pointer
+    /// on the fence: a hover peek must not open it again under that resting pointer. Lifted
+    /// when the pointer leaves the fence, and by any expand.
+    pub(super) peek_blocked: bool,
+    /// Open, but only as tall as the fences below leave room for (`rollUp.pushNeighbors`:
+    /// they slide down, at most to the bottom of the work area): the window's height now.
+    /// `expanded_h_px` keeps the full height, which is what is saved and what the fence opens
+    /// to again once there is room. None when the window is as tall as `expanded_h_px`.
+    pub(super) capped_h_px: Option<i32>,
+    /// Let go over another fence: the window glides from where it was dropped to the free
+    /// spot it lands on (`FenceWindow::glide_to`), ticked by the frame clock.
+    pub(super) glide: Option<WindowGlide>,
+    /// A display change places every fence in one pass (`FenceWindow::defer_moves`): while
+    /// this is set, a placement that only moves the window waits in `pending_place` and the
+    /// window glides there when the pass is over.
+    pub(super) defer_place: bool,
+    pub(super) pending_place: Option<RECT>,
+    /// The app is placing the window (`FenceWindow::place_window`, a cancelled drag put back):
+    /// the rect it sets is already in the target monitor's pixels, so a WM_DPICHANGED sent
+    /// inside that SetWindowPos (a move onto a monitor with another scale) must not scale it
+    /// again.
+    pub(super) placing: bool,
+    pub(super) behavior: Rc<Behavior>,
+}
+
+impl FenceViewState {
+    /// Posts `msg` with `wparam` to this window from the compositor's callback thread.
+    pub(super) fn poster(&self, msg: u32, wparam: usize) -> impl Fn() + Send + 'static {
+        let hwnd = self.hwnd.0 as isize;
+        move || window::post_message(HWND(hwnd as *mut core::ffi::c_void), msg, wparam, 0)
+    }
+
+    pub(super) fn scale(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+
+    /// Adopts a new DPI: rescales the remembered expanded height, refits the labels and reloads
+    /// the icons at the new pixel size. Returns true when something changed.
+    pub(super) fn apply_dpi(&mut self, new_dpi: u32) -> bool {
+        let new_dpi = new_dpi.max(96);
+        if new_dpi == self.dpi {
+            return false;
+        }
+        let old = self.dpi.max(96) as f32;
+        tracing::info!(fence = %self.fence_id, from = self.dpi, to = new_dpi, "fence DPI changed");
+        self.dpi = new_dpi;
+        // The optical bezel and upload mask are measured in DIPs. A DPI change can keep
+        // the same physical rectangle, so geometry alone cannot validate the old crop.
+        self.backdrop_rect = None;
+        self.expanded_h_px = (self.expanded_h_px as f32 * new_dpi as f32 / old).round() as i32;
+        self.capped_h_px = self
+            .capped_h_px
+            .map(|h| (h as f32 * new_dpi as f32 / old).round() as i32);
+        self.expanded_w_px = (self.expanded_w_px as f32 * new_dpi as f32 / old).round() as i32;
+        self.reload_icons_and_labels();
+        self.snap_item_motion();
+        // The infotip window scales its max width from the owner DPI at creation: rebuild it
+        // on the next show.
+        self.hide_tip();
+        self.tip = None;
+        true
+    }
+
+    /// Drops every fitted label and lets the icons reload lazily at the current size. Each icon
+    /// keeps its old bitmap, drawn scaled into the new box, until the new one replaces it
+    /// without a cross-fade (Explorer does the same): the icons never blank out in between.
+    pub(super) fn reload_icons_and_labels(&mut self) {
+        for item in &mut self.items {
+            item.icon_failed = false;
+            item.icon_waited = false;
+            item.icon_fade = None;
+            item.label = None;
+        }
+        self.unfold_cache = None;
+        self.fit_ahead_done = false;
+    }
+
+    /// The grid the fence asks for; its layout is the fence's own (`wanted_layout`).
+    pub(super) fn grid(&self) -> GridSpec {
+        GridSpec {
+            icon_size: self.icon_size,
+            label_lines: self.label_lines,
+            spacing: self.spacing,
+            icon_align: self.icon_align,
+            layout: self.wanted_layout,
+        }
+    }
+
+    /// The layout shown for `wanted`: 像桌面一样排列 shows icons whatever the fence's view.
+    pub(super) fn shown_layout(&self, wanted: ViewLayout) -> ViewLayout {
+        if self.bare() {
+            ViewLayout::Icons
+        } else {
+            wanted
+        }
+    }
+
+    /// Takes `grid`. Another icon size or shown layout reloads the icons; another cell refits
+    /// the labels; the alignment only moves the cells.
+    pub(super) fn take_grid(&mut self, grid: GridSpec) {
+        let layout = self.shown_layout(grid.layout);
+        if self.layout != layout {
+            self.header_hover = None;
+            self.header_fades.clear();
+        }
+        let reload = self.icon_size != grid.icon_size || self.layout != layout;
+        let refit = self.label_lines != grid.label_lines || self.spacing != grid.spacing;
+        self.icon_size = grid.icon_size;
+        self.label_lines = grid.label_lines;
+        self.spacing = grid.spacing;
+        self.icon_align = grid.icon_align;
+        self.wanted_layout = grid.layout;
+        self.layout = layout;
+        if reload {
+            self.reload_icons_and_labels();
+        } else if refit {
+            for item in &mut self.items {
+                item.label = None;
+            }
+            self.unfold_cache = None;
+        }
+        // Another view has other texts (the columns of the details view).
+        self.fit_ahead_done = false;
+    }
+
+    /// Lays the items out for `grid` at once, also when only the shown layout changes (像桌面一样
+    /// 排列 on or off). Returns whether anything changed.
+    pub(super) fn apply_grid(&mut self, grid: GridSpec) -> bool {
+        // Consumes the tab switch's pending offset either way (see `set_tabs`).
+        let restore = self.scroll_restore.take();
+        let layout = self.shown_layout(grid.layout);
+        if self.grid() == grid && self.layout == layout {
+            return false;
+        }
+        // Icons / list / details picked for the tab on show: the old view fades out under the
+        // new one (the tab switch's cross-fade without its slide). A tab switch brings its own
+        // swap; icon size, label lines and spacing steps (Ctrl+wheel, a slider) stay cuts.
+        let cross_fade = self.layout != layout
+            && restore.is_none()
+            && self.outgoing.is_empty()
+            && self.content_swap_shows();
+        if self.layout != layout {
+            self.scroll_anim = None;
+            // A genuine layout change starts at the top; a tab switch between tabs of
+            // different layouts keeps the restored offset (the redraw clamps it).
+            self.scroll_y = restore.unwrap_or(0.0);
+            self.reset_item_fades();
+            tracing::debug!(
+                fence = %self.fence_id,
+                from = ?self.layout,
+                to = ?layout,
+                cross_fade,
+                tab_switch = restore.is_some(),
+                swapping = !self.outgoing.is_empty(),
+                "view mode changed"
+            );
+        }
+        self.take_grid(grid);
+        self.snap_item_motion();
+        // The view or the cell size changed under a selection (not a tab switch, which brings
+        // its own offset): the focused file, else the first selected one, stays on screen, as
+        // in Explorer. A view change started at the top and left it out of sight.
+        if restore.is_none() {
+            self.reveal_selection();
+        }
+        if cross_fade {
+            // After `take_grid`: the swap draws the new panel once, in the new view.
+            self.begin_content_swap(0);
+        }
+        let _ = self.redraw();
+        // Another icon is under the resting pointer now (a Ctrl+wheel step): the hover fill
+        // goes to it at once; it stayed on the old icon until the fence had its new height.
+        self.request_hover_refresh();
+        true
+    }
+
+    /// Scrolls the focused item, else the first selected one, into view for the geometry the
+    /// fence has now. Returns whether the offset changed.
+    pub(super) fn reveal_selection(&mut self) -> bool {
+        let Some(i) = self
+            .anchor_index
+            .filter(|i| self.selected.contains(i))
+            .or_else(|| self.selected.iter().min().copied())
+            .filter(|i| *i < self.items.len())
+        else {
+            return false;
+        };
+        let before = self.scroll_y;
+        self.scroll_into_view(i, false);
+        tracing::debug!(
+            fence = %self.fence_id,
+            item = i,
+            from = before,
+            to = self.scroll_y,
+            "view changed: the selected item is kept in view"
+        );
+        self.scroll_y != before
+    }
+
+    /// Ends the layout motion at once: the geometry it was computed for (cell size, layout,
+    /// width, DPI) is gone, so old origins would glide to the wrong places.
+    pub(super) fn snap_item_motion(&mut self) {
+        self.item_motion.clear();
+        self.leaving.clear();
+    }
+
+    pub(super) fn backdrop_mode(&self) -> BackdropMode {
+        self.backdrop_override
+            .unwrap_or_else(|| self.behavior.backdrop.get())
+    }
+
+    /// Zero when animations are off (client tweens then snap; the begin delays still apply,
+    /// they are behaviour rather than motion).
+    pub(super) fn anim_dur(&self, dur: Duration) -> Duration {
+        if self.motion.enabled() {
+            dur
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// 像桌面一样排列: drawn like the Windows desktop (no title row, plate, rim or edges).
+    pub(super) fn bare(&self) -> bool {
+        self.desktop.is_some()
+    }
+
+    /// 便签与待办: the line of the to-do whose check box (with a little slack) is at client
+    /// point (`x`, `y`).
+    pub(super) fn note_box_at(&self, x: i32, y: i32) -> Option<usize> {
+        if self.note.is_none() || self.rolled_up || y < self.content_y || x < self.content_x {
+            return None;
+        }
+        let scale = self.scale();
+        let cx = (x - self.content_x) as f32 / scale;
+        let cy = (y - self.content_y) as f32 / scale;
+        const SLACK: f32 = 4.0;
+        self.note_boxes
+            .iter()
+            .find(|(_, r)| {
+                cx >= r[0] - SLACK && cx < r[2] + SLACK && cy >= r[1] - SLACK && cy < r[3] + SLACK
+            })
+            .map(|&(line, _)| line)
+    }
+
+    /// 便签与待办: a press at client point (`x`, `y`) in a note's text opens the editor with
+    /// the caret where the press was: the command that does it, which the caller sends at
+    /// once or, for a press on a to-do, on the release (`begin_todo_press`). None when this
+    /// window shows no note, the point is not in its content, or a check box is there
+    /// (`press_tool_at` takes that press).
+    pub(super) fn note_press(&self, x: i32, y: i32) -> Option<Command> {
+        if self.note.is_none() || self.rolled_up || y < self.content_y || x < self.content_x {
+            return None;
+        }
+        // A check box ticks, a web address opens (the second click of a double-click on one
+        // does nothing more).
+        if self.note_box_at(x, y).is_some() || self.note_link_at(x, y).is_some() {
+            return None;
+        }
+        Some(Command::EditNote {
+            fence: self.active,
+            caret: self.note_offset_at(x, y),
+        })
+    }
+
+    /// 便签与待办: the web address (its line and start) at client point (`x`, `y`) of a note
+    /// that is not being edited.
+    pub(super) fn note_link_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+        if self.note.is_none()
+            || self.note_edit.is_some()
+            || self.rolled_up
+            || y < self.content_y
+            || x < self.content_x
+            || self.scrollbar_hit(x, y).is_some()
+        {
+            return None;
+        }
+        let scale = self.scale();
+        let cx = (x - self.content_x) as f32 / scale;
+        let cy = (y - self.content_y) as f32 / scale;
+        self.note_links
+            .iter()
+            .find(|(_, _, r)| cx >= r[0] && cx < r[2] && cy >= r[1] && cy < r[3])
+            .map(|&(line, start, _)| (line, start))
+    }
+
+    /// 脚本栅栏: the clickable row at client point (`x`, `y`).
+    pub(super) fn script_row_at(&self, x: i32, y: i32) -> Option<usize> {
+        if self.script.is_none() || self.rolled_up || y < self.content_y || x < self.content_x {
+            return None;
+        }
+        let scale = self.scale();
+        let cx = (x - self.content_x) as f32 / scale;
+        let cy = (y - self.content_y) as f32 / scale;
+        self.script_rows
+            .iter()
+            .find(|(_, r)| cx >= r[0] && cx < r[2] && cy >= r[1] && cy < r[3])
+            .map(|&(row, _)| row)
+    }
+
+    /// The empty state's action row as drawn now: only under the text the app set (a drag
+    /// over the fence says 「松开即可放入」 alone).
+    pub(super) fn empty_action_draw(&self) -> Option<EmptyAction<'static>> {
+        let label = self.empty_action?;
+        (self.items.is_empty() && !self.drop_hover && self.empty_override.is_some()).then_some(
+            EmptyAction {
+                label,
+                hover: self.empty_action_hover,
+            },
+        )
+    }
+
+    /// The empty state's action row is under the client point.
+    pub(super) fn empty_action_at(&self, x: i32, y: i32) -> bool {
+        let Some(action) = self.empty_action_draw() else {
+            return false;
+        };
+        if self.rolled_up || x < self.content_x || y < self.content_y {
+            return false;
+        }
+        let scale = self.scale();
+        let cx = (x - self.content_x) as f32 / scale;
+        let cy = (y - self.content_y) as f32 / scale;
+        let (w, h) = self.content_size_px();
+        let header_h = self.row_metrics().map_or(0.0, |m| m.header_h);
+        self.chrome
+            .empty_action_rect(
+                self.empty_text(),
+                action.label,
+                w as f32 / scale,
+                h as f32 / scale,
+                header_h,
+            )
+            .is_some_and(|r| cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
+    }
+
+    /// A press on the empty state's action row: the app does what the row says.
+    pub(super) fn empty_action_press(&self, x: i32, y: i32) -> Option<Command> {
+        self.empty_action_at(x, y)
+            .then_some(Command::EmptyActionClicked { fence: self.active })
+    }
+
+    /// The pointer moved to the client point (None: it left the window): the action row
+    /// lights up under it. True when that changed, and the content needs a redraw.
+    pub(super) fn hover_empty_action(&mut self, at: Option<(i32, i32)>) -> bool {
+        let over = at.is_some_and(|(x, y)| self.empty_action_at(x, y));
+        std::mem::replace(&mut self.empty_action_hover, over) != over
+    }
+
+    /// The fence shown is a tool (小工具) in place of items: it takes no drops, merges or
+    /// marquee, and counts no items.
+    pub(super) fn shows_tool(&self) -> bool {
+        self.note.is_some() || self.clock.is_some() || self.script.is_some()
+    }
+
+    /// The rolled title shows 「N 项」 before the chevron: not for a tool (no items), a smart
+    /// fence (its capsule counts) or a filter tag (it carries the count).
+    pub(super) fn shows_rolled_count(&self) -> bool {
+        !self.shows_tool() && self.title_count.is_none() && self.filter_tag.is_none()
+    }
+
+    /// 「12 项」: the count a rolled fence shows before its chevron, in the interface language.
+    pub(super) fn rolled_count_caption(&self) -> String {
+        pecofence_core::i18n::format("{0} 项", &[self.items.len().to_string()])
+    }
+
+    /// The room that count takes in the title row, as drawn (its text is measured: a count in
+    /// words is wider than 「12 项」).
+    pub(super) fn rolled_count_room(&self) -> f32 {
+        self.chrome.rolled_count_room(&self.rolled_count_caption())
+    }
+
+    /// Nothing can be dropped here: a tool fence, or a smart fence (it shows a search).
+    pub(super) fn takes_no_drops(&self) -> bool {
+        self.shows_tool() || self.refuses_drops
+    }
+
+    /// Arms TIMER_CLOCK for just after the next minute (or second) boundary, or stops it when
+    /// the window shows no clock.
+    pub(super) fn arm_clock(&self) {
+        match self.clock {
+            Some(seconds) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let period_ms: u128 = if seconds { 1000 } else { 60_000 };
+                let wait = period_ms - now.as_millis() % period_ms + 20;
+                window::set_timer(self.hwnd, TIMER_CLOCK, wait as u32);
+            }
+            None => window::kill_timer(self.hwnd, TIMER_CLOCK),
+        }
+    }
+
+    pub(super) fn title_h_px(&self) -> i32 {
+        if self.bare() {
+            return 0;
+        }
+        (self.theme.title_height * self.scale()).round() as i32
+    }
+
+    /// Size of the content surface. Equal to the window minus the title bar after every
+    /// `layout_panels`; during a height animation it stays at the expanded size (hit-testing,
+    /// scrolling and redraws keep addressing the frozen surface).
+    pub(super) fn content_size_px(&self) -> (i32, i32) {
+        self.content_panel.size_px()
+    }
+}

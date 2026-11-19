@@ -1,0 +1,1154 @@
+//! Per-fence options shared by the fence context menu and the settings page's 「栅栏」 tab:
+//! one setter per property (state + window + anchor + save) and the page protocol
+//! (`fences[]` details in the state JSON, `setFence` messages, `showFence` navigation).
+//!
+//! Window-level properties (appearance, title on hover, lock, quick-hide exclusion, auto
+//! height, dock) act on the fence's host window when the fence is a tab; content properties
+//! (icon size, spacing, portal flags) act on the fence itself, exactly like the menu did.
+
+use super::*;
+
+/// Fences-style colour choices for the per-fence tint (name, rgb); the settings page builds
+/// its 色调 options from this list (`tintPalette` in the state JSON).
+const TINT_PALETTE: &[(&str, [u8; 3])] = &[
+    ("红", [0xE7, 0x48, 0x56]),
+    ("橙", [0xF7, 0x63, 0x0C]),
+    ("黄", [0xFF, 0xB9, 0x00]),
+    ("绿", [0x10, 0x89, 0x3E]),
+    ("青", [0x00, 0xB7, 0xC3]),
+    ("蓝", [0x00, 0x78, 0xD4]),
+    ("紫", [0x87, 0x64, 0xB8]),
+    ("粉", [0xE3, 0x00, 0x8C]),
+    ("灰", [0x7A, 0x75, 0x74]),
+];
+
+pub(super) fn tint_palette_json() -> serde_json::Value {
+    TINT_PALETTE
+        .iter()
+        .map(|(name, rgb)| serde_json::json!({ "name": pecofence_core::i18n::text(name), "hex": hex(*rgb) }))
+        .collect()
+}
+
+/// "更透明" / "更厚实" opacity presets (the menu's former values) and "全透明": no plate until
+/// the pointer is over the fence.
+const OPACITY_CLEAR: f32 = 0.55;
+const OPACITY_SOLID: f32 = 1.6;
+const OPACITY_NONE: f32 = 0.0;
+
+pub(super) fn hex(rgb: [u8; 3]) -> String {
+    format!("{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+pub(super) fn parse_hex(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(s, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
+/// A dragged settings slider marks its ticks `live`. They apply at once but leave the cell snap
+/// to the release, which comes without the flag, so a drag ends where one jump would.
+pub(super) fn is_live_tick(set_fence: &serde_json::Value) -> bool {
+    set_fence.get("live").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// Every property `parse_fence_prop` accepts (the order the error message lists them in).
+pub(super) const FENCE_PROPS: &[&str] = &[
+    "title",
+    "iconSize",
+    "spacing",
+    "spacingPx",
+    "iconAlign",
+    "autoHeight",
+    "locked",
+    "expandUpward",
+    "excludeFromQuickHide",
+    "opacity",
+    "tint",
+    "tintTitleOnly",
+    "tabColor",
+    "titleColor",
+    "titleSize",
+    "textSize",
+    "titleOnHover",
+    "transparentOnHover",
+    "layout",
+    "sort",
+    "reverse",
+    "groupByDate",
+    "foldersFirst",
+    "labelLines",
+    "openFoldersInside",
+    "portalNavigate",
+    "portalTitleIcon",
+    "hideWhenEmpty",
+    "desktopLayout",
+    "freePlacement",
+    "noteText",
+    "scriptPath",
+    "scriptInterval",
+    "smartFolder",
+    "smartMatch",
+    "smartSubfolders",
+    "smartWithinDays",
+    "smartConditions",
+    "smartName",
+    "smartEverything",
+    "smartLimit",
+    "virtualDesktops",
+];
+
+/// 智能栅栏: one change to a smart fence's search (`fence set` / the settings page).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum SmartChange {
+    /// The folders searched together; none = every drive (needs Everything).
+    Folders(Vec<String>),
+    /// 全部 / 任一 of the conditions (the folders always apply).
+    Match(pecofence_core::smart::SmartMatch),
+    Subfolders(bool),
+    WithinDays(Option<u32>),
+    Conditions(Vec<pecofence_core::Cond>),
+    /// The name filter (matched as the Peek search and 筛选 match names).
+    Name(Option<String>),
+    /// A typed Everything search in place of the conditions.
+    Everything(Option<String>),
+    Limit(u32),
+}
+
+impl SmartChange {
+    /// Makes the change to `spec`; what changed, for the log.
+    pub(super) fn apply(self, spec: &mut pecofence_core::smart::SmartSpec) -> &'static str {
+        match self {
+            SmartChange::Folders(folders) => {
+                spec.folders = folders;
+                "folders"
+            }
+            SmartChange::Match(matching) => {
+                spec.matching = matching;
+                "match"
+            }
+            SmartChange::Subfolders(on) => {
+                spec.subfolders = on;
+                "subfolders"
+            }
+            SmartChange::WithinDays(days) => {
+                spec.within_days = days;
+                "within days"
+            }
+            SmartChange::Conditions(conds) => {
+                spec.all_of = conds;
+                "conditions"
+            }
+            SmartChange::Name(name) => {
+                spec.name = name;
+                "name"
+            }
+            SmartChange::Everything(text) => {
+                spec.everything = text;
+                "everything search"
+            }
+            SmartChange::Limit(n) => {
+                spec.limit = n;
+                "limit"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TitleColorChoice {
+    Theme,
+    /// Follow the fence tint.
+    Tint,
+    Rgb([u8; 3]),
+}
+
+/// One per-fence option, parsed and range-checked (shared by the settings page's `setFence`
+/// and the CLI's `fences.setOption`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum FenceProp {
+    Title(String),
+    IconSize(u32),
+    /// Icon spacing in DIPs, from `spacing` (a preset) or `spacingPx`.
+    Spacing(i32),
+    /// 图标对齐 of the icons view.
+    IconAlign(IconAlign),
+    AutoHeight(bool),
+    Locked(bool),
+    /// 向上展开: the bottom edge stays put when the height changes.
+    ExpandUpward(bool),
+    ExcludeFromQuickHide(bool),
+    /// None = the global default; otherwise a preset (`OPACITY_CLEAR` / `_SOLID` / `_NONE`).
+    Opacity(Option<f32>),
+    Tint(Option<[u8; 3]>),
+    TintTitleOnly(bool),
+    /// None = the tab's tint.
+    TabColor(Option<[u8; 3]>),
+    TitleColor(TitleColorChoice),
+    /// None = normal.
+    TitleSize(Option<TitleSize>),
+    /// 文字大小 of a note or script fence (None = normal).
+    TextSize(Option<TitleSize>),
+    /// None = the global `rollUp.titleOnHover`.
+    TitleOnHover(Option<bool>),
+    /// 鼠标移入时保持透明: acts while the opacity is 全透明.
+    TransparentOnHover(bool),
+    /// Regular fences: a double-clicked folder opens inside the fence.
+    OpenFoldersInside(bool),
+    PortalNavigate(bool),
+    PortalTitleIcon(bool),
+    /// 为空时自动隐藏.
+    HideWhenEmpty(bool),
+    /// 像桌面一样排列 (the inbox only).
+    DesktopLayout(bool),
+    /// 自由摆放 (the inbox only; acts while it is arranged like the desktop).
+    FreePlacement(bool),
+    Layout(ViewLayout),
+    Sort(SortMode),
+    Reverse(bool),
+    GroupByDate(bool),
+    FoldersFirst(bool),
+    LabelLines(u8),
+    /// 便签与待办: the whole text of a note fence.
+    NoteText(String),
+    /// 脚本栅栏: the script a script fence runs (runs it at once).
+    ScriptPath(String),
+    /// 脚本栅栏: minutes between runs, 1 to 1440.
+    ScriptInterval(u32),
+    /// 智能栅栏: a change to its search.
+    Smart(SmartChange),
+    /// 在哪个虚拟桌面显示, as given: `all`, `current`, numbers, names or keys (see
+    /// `App::resolve_desktop_specs`).
+    VirtualDesktops(Vec<String>),
+}
+
+impl FenceProp {
+    /// A property about the icons a fence holds (their size, layout, order, the height they
+    /// need): a tool fence has none.
+    pub(super) fn is_about_icons(&self) -> bool {
+        matches!(
+            self,
+            Self::IconSize(_)
+                | Self::Spacing(_)
+                | Self::IconAlign(_)
+                | Self::AutoHeight(_)
+                | Self::OpenFoldersInside(_)
+                | Self::PortalNavigate(_)
+                | Self::PortalTitleIcon(_)
+                | Self::HideWhenEmpty(_)
+                | Self::DesktopLayout(_)
+                | Self::FreePlacement(_)
+                | Self::Layout(_)
+                | Self::Sort(_)
+                | Self::Reverse(_)
+                | Self::GroupByDate(_)
+                | Self::FoldersFirst(_)
+                | Self::LabelLines(_)
+        )
+    }
+
+    /// The tool a property belongs to, None for one every fence has.
+    pub(super) fn tool(&self) -> Option<pecofence_core::FenceTool> {
+        match self {
+            Self::NoteText(_) => Some(pecofence_core::FenceTool::Note),
+            Self::ScriptPath(_) | Self::ScriptInterval(_) => {
+                Some(pecofence_core::FenceTool::Script)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parses `prop` / `value` as the settings page and `fence get` spell them. Unknown property
+/// → `invalid_value` listing every property; a bad value → `invalid_value` listing what the
+/// property accepts.
+pub(super) fn parse_fence_prop(
+    prop: &str,
+    value: &serde_json::Value,
+) -> std::result::Result<FenceProp, pecofence_ipc::IpcError> {
+    use pecofence_ipc::IpcError;
+    let bad = |allowed: &[&str]| {
+        IpcError::invalid_value(
+            format!("{prop} cannot be {value}; allowed: {}", allowed.join(", ")),
+            allowed,
+        )
+    };
+    let as_bool = || value.as_bool().ok_or_else(|| bad(&["true", "false"]));
+    let as_str = |allowed: &[&str]| value.as_str().ok_or_else(|| bad(allowed));
+    Ok(match prop {
+        "title" => {
+            let title = as_str(&["<non-empty string>"])?;
+            FenceProp::Title(super::ipc::checked_name("title", title)?)
+        }
+        "iconSize" => {
+            use crate::layout::{ICON_SIZE_MAX, ICON_SIZE_MIN, ICON_SIZE_STEP};
+            match value.as_u64() {
+                Some(size) if crate::layout::is_icon_size(size) => FenceProp::IconSize(size as u32),
+                _ => {
+                    let range =
+                        format!("{ICON_SIZE_MIN} to {ICON_SIZE_MAX} in steps of {ICON_SIZE_STEP}");
+                    return Err(bad(&[range.as_str()]));
+                }
+            }
+        }
+        "spacing" => {
+            const ALLOWED: &[&str] = &["compact", "normal", "loose"];
+            FenceProp::Spacing(
+                match as_str(ALLOWED)? {
+                    "compact" => Spacing::Compact,
+                    "normal" => Spacing::Normal,
+                    "loose" => Spacing::Loose,
+                    _ => return Err(bad(ALLOWED)),
+                }
+                .px(),
+            )
+        }
+        "spacingPx" => match value.as_i64().and_then(|n| i32::try_from(n).ok()) {
+            Some(px) if Spacing::is_valid_px(px) => FenceProp::Spacing(px),
+            _ => {
+                let (min, max, step) = (Spacing::PX_MIN, Spacing::PX_MAX, Spacing::PX_STEP);
+                return Err(bad(&[&format!("{min} to {max} in steps of {step}")]));
+            }
+        },
+        "iconAlign" => {
+            const ALLOWED: &[&str] = &["left", "center", "right"];
+            FenceProp::IconAlign(match as_str(ALLOWED)? {
+                "left" => IconAlign::Left,
+                "center" => IconAlign::Center,
+                "right" => IconAlign::Right,
+                _ => return Err(bad(ALLOWED)),
+            })
+        }
+        "autoHeight" => FenceProp::AutoHeight(as_bool()?),
+        "locked" => FenceProp::Locked(as_bool()?),
+        "expandUpward" => FenceProp::ExpandUpward(as_bool()?),
+        "excludeFromQuickHide" => FenceProp::ExcludeFromQuickHide(as_bool()?),
+        "opacity" => {
+            const ALLOWED: &[&str] = &["default", "clear", "solid", "transparent"];
+            FenceProp::Opacity(match as_str(ALLOWED)? {
+                "default" => None,
+                "clear" => Some(OPACITY_CLEAR),
+                "solid" => Some(OPACITY_SOLID),
+                "transparent" => Some(OPACITY_NONE),
+                _ => return Err(bad(ALLOWED)),
+            })
+        }
+        "tint" | "tabColor" => {
+            const ALLOWED: &[&str] = &["#RRGGBB", "null"];
+            let rgb = match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) if s.is_empty() => None,
+                serde_json::Value::String(s) => Some(parse_hex(s).ok_or_else(|| bad(ALLOWED))?),
+                _ => return Err(bad(ALLOWED)),
+            };
+            if prop == "tint" {
+                FenceProp::Tint(rgb)
+            } else {
+                FenceProp::TabColor(rgb)
+            }
+        }
+        "tintTitleOnly" => FenceProp::TintTitleOnly(as_bool()?),
+        "titleColor" => {
+            const ALLOWED: &[&str] = &["theme", "tint", "white", "black", "#RRGGBB"];
+            FenceProp::TitleColor(match as_str(ALLOWED)? {
+                "theme" => TitleColorChoice::Theme,
+                "tint" => TitleColorChoice::Tint,
+                "white" => TitleColorChoice::Rgb([0xFF, 0xFF, 0xFF]),
+                "black" => TitleColorChoice::Rgb([0x00, 0x00, 0x00]),
+                other => TitleColorChoice::Rgb(parse_hex(other).ok_or_else(|| bad(ALLOWED))?),
+            })
+        }
+        "titleSize" | "textSize" => {
+            const ALLOWED: &[&str] = &["small", "normal", "large", "extraLarge"];
+            let size = match as_str(ALLOWED)? {
+                "small" => Some(TitleSize::Small),
+                "normal" => None,
+                "large" => Some(TitleSize::Large),
+                "extraLarge" => Some(TitleSize::ExtraLarge),
+                _ => return Err(bad(ALLOWED)),
+            };
+            if prop == "titleSize" {
+                FenceProp::TitleSize(size)
+            } else {
+                FenceProp::TextSize(size)
+            }
+        }
+        "titleOnHover" => {
+            const ALLOWED: &[&str] = &["default", "hover", "always"];
+            FenceProp::TitleOnHover(match as_str(ALLOWED)? {
+                "default" => None,
+                "hover" => Some(true),
+                "always" => Some(false),
+                _ => return Err(bad(ALLOWED)),
+            })
+        }
+        "transparentOnHover" => FenceProp::TransparentOnHover(as_bool()?),
+        "layout" => {
+            const ALLOWED: &[&str] = &["icons", "list", "details"];
+            FenceProp::Layout(match as_str(ALLOWED)? {
+                "icons" => ViewLayout::Icons,
+                "list" => ViewLayout::List,
+                "details" => ViewLayout::Details,
+                _ => return Err(bad(ALLOWED)),
+            })
+        }
+        "sort" => {
+            const ALLOWED: &[&str] = &["manual", "name", "type", "date", "size", "openCount"];
+            FenceProp::Sort(match as_str(ALLOWED)? {
+                "manual" => SortMode::Manual,
+                "name" => SortMode::Name,
+                "type" => SortMode::Type,
+                "date" => SortMode::Date,
+                "size" => SortMode::Size,
+                "openCount" => SortMode::OpenCount,
+                _ => return Err(bad(ALLOWED)),
+            })
+        }
+        "reverse" => FenceProp::Reverse(as_bool()?),
+        "groupByDate" => FenceProp::GroupByDate(as_bool()?),
+        "foldersFirst" => FenceProp::FoldersFirst(as_bool()?),
+        "labelLines" => {
+            const ALLOWED: &[&str] = &["0", "1", "2", "3"];
+            match value.as_u64() {
+                Some(n @ 0..=3) => FenceProp::LabelLines(n as u8),
+                _ => return Err(bad(ALLOWED)),
+            }
+        }
+        "openFoldersInside" => FenceProp::OpenFoldersInside(as_bool()?),
+        "portalNavigate" => FenceProp::PortalNavigate(as_bool()?),
+        "portalTitleIcon" => FenceProp::PortalTitleIcon(as_bool()?),
+        "hideWhenEmpty" => FenceProp::HideWhenEmpty(as_bool()?),
+        "desktopLayout" => FenceProp::DesktopLayout(as_bool()?),
+        "freePlacement" => FenceProp::FreePlacement(as_bool()?),
+        "noteText" => FenceProp::NoteText(as_str(&["<text>"])?.replace("\r\n", "\n")),
+        "scriptPath" => {
+            let path = as_str(&["<full path of a script>"])?;
+            if !std::path::Path::new(path).is_file() {
+                return Err(IpcError::invalid_value(
+                    format!("no such script: {path}"),
+                    &["<full path of an existing .ps1, .py, .cmd, .bat, .js or .exe>"],
+                ));
+            }
+            FenceProp::ScriptPath(path.to_string())
+        }
+        "scriptInterval" => match value.as_u64() {
+            Some(m @ 1..=1440) => FenceProp::ScriptInterval(m as u32),
+            _ => return Err(bad(&["1..1440 (minutes)"])),
+        },
+        "smartFolder" => {
+            const ALLOWED: &[&str] = &[
+                "<full path of a folder>",
+                r#"["<folder>", "<folder>"] (searched together)"#,
+                "null (every drive)",
+            ];
+            let texts: Vec<&str> = match value {
+                serde_json::Value::Null => Vec::new(),
+                serde_json::Value::String(s) if s.trim().is_empty() => Vec::new(),
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Array(list) => list
+                    .iter()
+                    .map(|v| v.as_str().ok_or_else(|| bad(ALLOWED)))
+                    .collect::<std::result::Result<_, _>>()?,
+                _ => return Err(bad(ALLOWED)),
+            };
+            let mut folders: Vec<String> = Vec::new();
+            for s in texts {
+                let dir = std::path::Path::new(s.trim());
+                if !dir.is_absolute() || !dir.is_dir() {
+                    return Err(IpcError::invalid_value(
+                        format!("no folder at {s}"),
+                        ALLOWED,
+                    ));
+                }
+                let dir = crate::state::canonical_path(dir.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned();
+                if !folders.iter().any(|f| f.eq_ignore_ascii_case(&dir)) {
+                    folders.push(dir);
+                }
+            }
+            FenceProp::Smart(SmartChange::Folders(folders))
+        }
+        "smartMatch" => FenceProp::Smart(SmartChange::Match(
+            value
+                .as_str()
+                .and_then(pecofence_core::smart::SmartMatch::parse)
+                .ok_or_else(|| bad(&["all", "any"]))?,
+        )),
+        "smartSubfolders" => FenceProp::Smart(SmartChange::Subfolders(as_bool()?)),
+        "smartWithinDays" => FenceProp::Smart(SmartChange::WithinDays(match value {
+            serde_json::Value::Null => None,
+            v => match v.as_u64() {
+                Some(d @ 1..=36500) => Some(d as u32),
+                _ => return Err(bad(&["1..36500 (days)", "null (any time)"])),
+            },
+        })),
+        "smartConditions" => {
+            const ALLOWED: &[&str] =
+                &[r#"[{"cond":"ext","value":["pdf"]}, ...] (rule conditions but origin)"#];
+            let conds: Vec<pecofence_core::Cond> = serde_json::from_value(value.clone())
+                .map_err(|e| IpcError::invalid_value(format!("smartConditions: {e}"), ALLOWED))?;
+            // 来源 says which desktop an icon came from: nothing a found file has.
+            if conds
+                .iter()
+                .any(|c| matches!(c, pecofence_core::Cond::Origin(_)))
+            {
+                return Err(IpcError::invalid_value(
+                    "origin is not a smart fence condition",
+                    ALLOWED,
+                ));
+            }
+            FenceProp::Smart(SmartChange::Conditions(conds))
+        }
+        "smartName" | "smartEverything" => {
+            let text = match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => {
+                    Some(s.trim().to_string()).filter(|s| !s.is_empty())
+                }
+                _ => return Err(bad(&["<text>", "null"])),
+            };
+            FenceProp::Smart(if prop == "smartName" {
+                SmartChange::Name(text)
+            } else {
+                SmartChange::Everything(text)
+            })
+        }
+        "smartLimit" => match value.as_u64() {
+            Some(n @ 1..=2000) => FenceProp::Smart(SmartChange::Limit(n as u32)),
+            _ => return Err(bad(&["1..2000"])),
+        },
+        "virtualDesktops" => {
+            const ALLOWED: &[&str] = &[
+                "all",
+                "current",
+                "<desktop numbers, names or ids, comma-separated>",
+            ];
+            let specs: Vec<String> = match value {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Number(n) => vec![n.to_string()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        serde_json::Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| bad(ALLOWED))?,
+                _ => return Err(bad(ALLOWED)),
+            };
+            if specs.iter().all(|s| s.trim().is_empty()) {
+                return Err(bad(ALLOWED));
+            }
+            FenceProp::VirtualDesktops(specs)
+        }
+        _ => {
+            return Err(IpcError::invalid_value(
+                format!("unknown fence property {prop:?}"),
+                FENCE_PROPS,
+            ));
+        }
+    })
+}
+
+/// A title or text size as the page, `fence get` and `fence set` spell it.
+pub(super) fn size_name(size: Option<TitleSize>) -> &'static str {
+    match size.unwrap_or_default() {
+        TitleSize::Small => "small",
+        TitleSize::Normal => "normal",
+        TitleSize::Large => "large",
+        TitleSize::ExtraLarge => "extraLarge",
+    }
+}
+
+/// String forms of `FenceView.layout` / `.sort` as the page, `fence get` and `fence set` use.
+pub(super) fn layout_name(layout: ViewLayout) -> &'static str {
+    match layout {
+        ViewLayout::Icons => "icons",
+        ViewLayout::List => "list",
+        ViewLayout::Details => "details",
+    }
+}
+
+pub(super) fn sort_name(sort: SortMode) -> &'static str {
+    match sort {
+        SortMode::Manual => "manual",
+        SortMode::Name => "name",
+        SortMode::Type => "type",
+        SortMode::Date => "date",
+        SortMode::Size => "size",
+        SortMode::OpenCount => "openCount",
+    }
+}
+
+impl App {
+    pub(super) fn set_fence_auto_height(&mut self, fence: FenceId, on: bool) {
+        let host = self.state.host_of(fence);
+        self.state.set_auto_height(host, on);
+        if let Some(w) = self.fences.get(&host) {
+            w.set_auto_height(on);
+        }
+        self.apply_auto_height(host);
+        self.schedule_save();
+    }
+
+    pub(super) fn set_fence_locked(&mut self, fence: FenceId, on: bool) {
+        let host = self.state.host_of(fence);
+        self.state.set_locked(host, on);
+        if let Some(w) = self.fences.get(&host) {
+            w.set_locked(on);
+        }
+        self.schedule_save();
+    }
+
+    /// 向上展开 (a window-level flag: a tab sets its host's). Nothing moves: a rolled title row
+    /// stays where it is and its expanded rect is recorded again around it (switched on, above
+    /// it where it fits there, see `AppState::set_fence_bounds`; switched off, below it, like
+    /// any fence). An open fence keeps the edge it opened from until it rolls up.
+    pub(super) fn set_fence_expand_upward(&mut self, fence: FenceId, on: bool) {
+        let host = self.state.host_of(fence);
+        self.state.set_expand_upward(host, on);
+        let rolled = self.fences.get(&host).and_then(|w| {
+            w.set_expand_upward(on)
+                .then(|| (w.rect(), w.expanded_height_px()))
+        });
+        if let Some((rect, expanded)) = rolled {
+            self.record_bounds(host, rect, true, expanded, "expand upward");
+        }
+        self.schedule_save();
+    }
+
+    pub(super) fn set_fence_quick_hide_excluded(&mut self, fence: FenceId, on: bool) {
+        let host = self.state.host_of(fence);
+        self.state.set_exclude_from_quick_hide(host, on);
+        if let Some(w) = self.fences.get(&host)
+            && let Some(a) = self.anchor.borrow_mut().as_mut()
+        {
+            a.set_quick_hide_excluded(w.hwnd(), on);
+        }
+        self.schedule_save();
+    }
+
+    /// 像桌面一样排列: the inbox's icons stand on the desktop like Windows' own (other fences
+    /// keep their look; the flag is saved but has no effect on them).
+    pub(super) fn set_fence_desktop_layout(&mut self, fence: FenceId, on: bool, from: &str) {
+        tracing::info!(%fence, on, from, "desktop layout switched");
+        self.state.set_desktop_layout(fence, on);
+        if on {
+            self.want_windows_places();
+        }
+        self.sync_hidden_fences();
+        self.apply_fence_view(fence);
+        self.schedule_save();
+    }
+
+    /// 自由摆放 of the 「桌面」 fence arranged like the desktop.
+    pub(super) fn set_fence_free_placement(&mut self, fence: FenceId, on: bool, from: &str) {
+        let cells = self.state.fence(fence).map_or(0, |f| f.desktop_cells.len());
+        tracing::info!(%fence, on, from, saved_cells = cells, "free placement switched");
+        self.state.set_free_placement(fence, on);
+        if on {
+            self.want_windows_places();
+        }
+        self.arrange_desktop_fence();
+        self.schedule_save();
+    }
+
+    /// 自由摆放: icons dropped on the desktop (or on the icons of 「桌面」) stay in the grid
+    /// cells they landed in. False when 「桌面」 does not place its icons freely: then they go
+    /// back to it as before.
+    pub(super) fn drop_on_free_desktop(
+        &mut self,
+        inbox: FenceId,
+        items: &[ItemId],
+        at: &crate::commands::DesktopDrop,
+    ) -> bool {
+        let Some(cells) = self
+            .fences
+            .get(&inbox)
+            .and_then(|w| w.desktop_drop_cells(at))
+        else {
+            return false;
+        };
+        let own = self
+            .state
+            .fence(inbox)
+            .is_some_and(|f| items.iter().all(|i| f.contains_item(*i)));
+        tracing::info!(
+            items = items.len(),
+            own,
+            cursor = ?at.cursor,
+            first_cell = ?cells.first().map(|c| c.1),
+            "free placement: icons dropped"
+        );
+        self.state.set_desktop_cells(inbox, &cells);
+        if own && let Some(w) = self.fences.get(&inbox) {
+            w.note_hand_move(at);
+        }
+        // The window takes the new cells first, so icons that come from another fence land in
+        // them rather than in the first free ones.
+        self.arrange_desktop_fence();
+        if !own {
+            // Let go on the bare desktop, the window of 「桌面」 did not see the drop: it learns
+            // here where the icons were let go, and they arrive from there.
+            if let Some(w) = self.fences.get(&inbox) {
+                w.note_desktop_landing(at);
+            }
+            self.move_items(items, inbox);
+        } else if let Some(w) = self.fences.get(&inbox) {
+            // Its own icons, moved by hand: they settle into the new cells from the pointer.
+            w.land_moved_icons(at);
+        }
+        self.schedule_save();
+        true
+    }
+
+    /// 为空时自动隐藏 (feedback #88: every fence, not only the inbox).
+    pub(super) fn set_fence_hide_when_empty(&mut self, fence: FenceId, on: bool) {
+        self.state.set_hide_when_empty(fence, on);
+        self.sync_hidden_fences();
+        self.schedule_save();
+    }
+
+    /// `None` = default opacity; otherwise one of the presets (or any imported value).
+    pub(super) fn set_fence_opacity(&mut self, fence: FenceId, opacity: Option<f32>) {
+        let host = self.state.host_of(fence);
+        self.state.set_appearance(host, None, opacity);
+        self.apply_fence_appearance(host);
+        self.schedule_save();
+    }
+
+    /// Tint / title colour / title size in one go (`None` fields = theme defaults). A title
+    /// that followed the tint keeps following it; clearing the tint clears such a title.
+    pub(super) fn set_fence_style(
+        &mut self,
+        fence: FenceId,
+        tint: Option<[u8; 3]>,
+        title_rgb: Option<[u8; 3]>,
+        title_size: Option<TitleSize>,
+    ) {
+        let host = self.state.host_of(fence);
+        self.state.set_style(host, tint, title_rgb, title_size);
+        self.apply_fence_appearance(host);
+        // Tab colour bars follow the tint.
+        self.refresh_fence(host);
+        self.schedule_save();
+    }
+
+    pub(super) fn set_fence_tint(&mut self, fence: FenceId, tint: Option<[u8; 3]>) {
+        let host = self.state.host_of(fence);
+        let (old_tint, mut title_rgb, title_size) = self.style_of(host);
+        let follow = title_rgb.is_some() && title_rgb == old_tint;
+        if follow {
+            title_rgb = tint;
+        }
+        self.set_fence_style(fence, tint, title_rgb, title_size);
+    }
+
+    pub(super) fn set_fence_tint_title_only(&mut self, fence: FenceId, on: bool) {
+        let host = self.state.host_of(fence);
+        self.state.set_tint_title_only(host, on);
+        self.apply_fence_appearance(host);
+        self.schedule_save();
+    }
+
+    /// A tab's own bar colour; it stays with the tab, whichever window it is in.
+    pub(super) fn set_fence_tab_color(&mut self, fence: FenceId, rgb: Option<[u8; 3]>) {
+        self.state.set_tab_color(fence, rgb);
+        self.refresh_fence(fence);
+        self.schedule_save();
+    }
+
+    /// A tab keeps its own title appearance when it joins or leaves a stack.
+    fn set_fence_title_style(
+        &mut self,
+        fence: FenceId,
+        color: Option<[u8; 3]>,
+        size: Option<TitleSize>,
+    ) {
+        let (tint, _, _) = self.style_of(fence);
+        self.state.set_style(fence, tint, color, size);
+        if self.state.host_of(fence) == fence {
+            self.apply_fence_appearance(fence);
+        }
+        self.refresh_fence(fence);
+        self.schedule_save();
+    }
+
+    /// 文字大小 of a note or script fence: its lines, check boxes and clickable rows (and the
+    /// note editor) take the size.
+    pub(super) fn set_fence_text_size(&mut self, fence: FenceId, size: Option<TitleSize>) {
+        self.state.set_text_size(fence, size);
+        // Numbers only, so the shareable log keeps them: 0 small to 3 extra large.
+        let text_size = self.state.fence(fence).map_or(1, text_size_index);
+        let font_dip = pecofence_render::fence_chrome::TOOL_TEXT_SIZES[usize::from(text_size)];
+        tracing::info!(%fence, text_size, font_dip, "fence text size set");
+        self.apply_fence_appearance(fence);
+        self.schedule_save();
+    }
+
+    /// `None` = follow the global 「鼠标悬停时才显示标题栏」.
+    pub(super) fn set_fence_title_on_hover(&mut self, fence: FenceId, on: Option<bool>) {
+        let host = self.state.host_of(fence);
+        self.state.set_title_on_hover(host, on);
+        self.apply_fence_appearance(host);
+        self.schedule_save();
+    }
+
+    /// 鼠标移入时保持透明: the pointer over a fully transparent fence shows neither its plate
+    /// nor a folded title row.
+    pub(super) fn set_fence_transparent_on_hover(&mut self, fence: FenceId, on: bool) {
+        let host = self.state.host_of(fence);
+        self.state.set_transparent_on_hover(host, on);
+        self.apply_fence_appearance(host);
+        self.schedule_save();
+    }
+
+    /// Icon spacing in DIPs.
+    pub(super) fn set_fence_spacing(&mut self, fence: FenceId, px: i32) {
+        self.state.set_spacing(fence, px);
+        self.show_grid(fence);
+        self.apply_cell_snap(fence);
+        self.fit_height_to_content(fence);
+        self.apply_auto_height(fence);
+        self.schedule_save();
+    }
+
+    /// 图标对齐: only where the icons sit in their rows changes, so the size stays.
+    pub(super) fn set_fence_icon_align(&mut self, fence: FenceId, align: IconAlign) {
+        self.state.set_icon_align(fence, align);
+        self.show_grid(fence);
+        self.schedule_save();
+    }
+
+    pub(super) fn set_fence_portal_navigate(&mut self, fence: FenceId, on: bool) {
+        self.state.set_portal_navigate(fence, on);
+        self.apply_portal_deco(self.state.host_of(fence));
+        self.schedule_save();
+    }
+
+    pub(super) fn set_fence_open_folders_inside(&mut self, fence: FenceId, on: bool) {
+        self.state.set_open_folders_inside(fence, on);
+        self.apply_portal_deco(self.state.host_of(fence));
+        self.schedule_save();
+    }
+
+    pub(super) fn set_fence_title_icon(&mut self, fence: FenceId, show: bool) {
+        self.state.set_hide_title_icon(fence, !show);
+        let host = self.state.host_of(fence);
+        // The tab pills carry the glyph too: push the strip so they follow at once.
+        if let Some(w) = self.fences.get(&host) {
+            w.set_tabs(self.tab_views(host), self.state.active_tab_of(host));
+        }
+        self.apply_portal_deco(host);
+        self.schedule_save();
+    }
+
+    /// (tint, title colour, title size) of the host window's appearance override.
+    fn style_of(&self, host: FenceId) -> (Option<[u8; 3]>, Option<[u8; 3]>, Option<TitleSize>) {
+        self.state
+            .fence(host)
+            .and_then(|f| f.appearance.as_ref())
+            .map(|a| (a.tint_rgb, a.title_rgb, a.title_size))
+            .unwrap_or((None, None, None))
+    }
+
+    /// Opens the settings window on the 「栅栏」 page with `fence` selected.
+    pub(super) fn open_fence_options(&mut self, fence: FenceId) {
+        // A new window opens beside the fence: its frame shows before the page is there.
+        self.open_settings_beside(self.window_for(fence).map(|w| w.rect()));
+        let Some(host) = &self.settings else {
+            return;
+        };
+        if let Some(w) = self.window_for(fence) {
+            host.place_beside(w.rect());
+        }
+        if host.ready {
+            self.post_show_fence(fence);
+        } else {
+            // The page is still loading; `ready` delivers the state and then the latest
+            // request: this fence, or the feedback form.
+            self.settings_focus_fence = Some(fence);
+            self.feedback.focus = None;
+        }
+    }
+
+    pub(super) fn post_show_fence(&self, fence: FenceId) {
+        if let Some(h) = &self.settings {
+            h.post_json(&serde_json::json!({ "type": "showFence", "id": fence }).to_string());
+        }
+    }
+
+    /// The per-fence block of the state JSON. Window-level values come from the host so a
+    /// tab shows (and edits) what its window actually uses.
+    pub(super) fn fence_options_json(&self, f: &pecofence_core::Fence) -> serde_json::Value {
+        let host_id = self.state.host_of(f.id);
+        let h = self.state.fence(host_id).unwrap_or(f);
+        let (tint, _, _) = self.style_of(host_id);
+        let (_, title_rgb, title_size) = self.style_of(f.id);
+        let opacity = h.appearance.as_ref().and_then(|a| a.opacity);
+        let opacity = match opacity {
+            None => "default",
+            Some(o) if o <= 0.0 => "transparent",
+            Some(o) if o < 1.0 => "clear",
+            Some(_) => "solid",
+        };
+        let title_color = match title_rgb {
+            None => "theme".to_string(),
+            Some(rgb) if tint == Some(rgb) => "tint".to_string(),
+            Some([0xFF, 0xFF, 0xFF]) => "white".to_string(),
+            Some([0x00, 0x00, 0x00]) => "black".to_string(),
+            Some(rgb) => hex(rgb),
+        };
+        let title_on_hover = match h.appearance.as_ref().and_then(|a| a.title_on_hover) {
+            None => "default",
+            Some(true) => "hover",
+            Some(false) => "always",
+        };
+        let title_size = size_name(title_size);
+        let spacing = match Spacing::nearest(f.view.spacing) {
+            Spacing::Compact => "compact",
+            Spacing::Normal => "normal",
+            Spacing::Loose => "loose",
+        };
+        let portal = (f.kind == FenceKind::FolderPortal).then(|| {
+            serde_json::json!({
+                "navigate": f.portal_navigate,
+                "titleIcon": !f.hide_title_icon,
+            })
+        });
+        serde_json::json!({
+            "id": f.id,
+            "title": f.title,
+            "kind": match f.kind {
+                FenceKind::Inbox => "inbox",
+                FenceKind::Virtual => "virtual",
+                FenceKind::FolderPortal => "portal",
+            },
+            "host": (host_id != f.id).then(|| self.state.fence(host_id).map(|h| h.title.clone())),
+            // 小工具: `{"kind": "note"}` for a note fence, null for one that shows items.
+            "tool": f.tool,
+            "tabbed": self.state.tabs_of(host_id).len() > 1,
+            "iconSize": f.view.icon_size,
+            "spacing": spacing,
+            "spacingPx": f.view.spacing,
+            "labelLines": f.view.label_lines,
+            "layout": layout_name(f.view.layout),
+            // 排序方式 on the 栅栏 page (the fence menu's own choices).
+            "sort": sort_name(f.view.sort),
+            "reverse": f.view.reverse,
+            "foldersFirst": f.view.folders_first,
+            "iconAlign": match f.view.icon_align {
+                IconAlign::Left => "left",
+                IconAlign::Center => "center",
+                IconAlign::Right => "right",
+            },
+            "autoHeight": h.view.auto_height,
+            "locked": h.locked,
+            "expandUpward": h.expand_upward,
+            "excludeFromQuickHide": h.exclude_from_quick_hide,
+            "opacity": opacity,
+            "tint": tint.map(hex),
+            "tintTitleOnly": h.appearance.as_ref().is_some_and(|a| a.tint_title_only),
+            "tabColor": f.appearance.as_ref().and_then(|a| a.tab_rgb).map(hex),
+            "titleColor": title_color,
+            "titleSize": title_size,
+            // 文字大小 (note and script fences).
+            "textSize": size_name(f.appearance.as_ref().and_then(|a| a.text_size)),
+            "titleOnHover": title_on_hover,
+            "transparentOnHover": h.appearance.as_ref().is_some_and(|a| a.transparent_on_hover),
+            "hideWhenEmpty": f.hide_when_empty,
+            "desktopLayout": f.desktop_layout,
+            "freePlacement": f.free_placement,
+            "openFoldersInside": f.open_folders_inside,
+            "virtualDesktops": h.virtual_desktops,
+            // 「桌面」 or a window holding it: always on every virtual desktop.
+            "inboxWindow": self.state.window_holds_inbox(f.id),
+            "portal": portal,
+            // 智能栅栏: its search and the last run (see `App::smart_dto`), and the magnifier.
+            "smart": self.smart_dto(f.id).map(|mut s| {
+                s["titleIcon"] = serde_json::Value::Bool(!f.hide_title_icon);
+                s
+            }),
+        })
+    }
+
+    /// `{"type":"setFence","id":…,"prop":…,"value":…}` from the page.
+    pub(super) fn on_set_fence(&mut self, v: &serde_json::Value) {
+        let Some(fence) = v
+            .get("id")
+            .and_then(|i| i.as_str())
+            .and_then(|i| uuid::Uuid::parse_str(i).ok())
+        else {
+            return;
+        };
+        if self.state.fence(fence).is_none() {
+            return;
+        }
+        let Some(prop) = v.get("prop").and_then(|p| p.as_str()) else {
+            return;
+        };
+        let value = v.get("value").cloned().unwrap_or(serde_json::Value::Null);
+        if prop == "dockTop" {
+            // An action, not a property (the CLI has `fences.dockTop`); the page still sends
+            // it through `setFence`.
+            self.dock_to_top(self.state.host_of(fence));
+        } else {
+            match parse_fence_prop(prop, &value) {
+                Ok(p) => {
+                    self.snap_held = is_live_tick(v);
+                    self.apply_fence_prop(fence, p);
+                    self.snap_held = false;
+                }
+                Err(error) => {
+                    tracing::warn!(prop, %error, "bad fence property from settings page");
+                    return;
+                }
+            }
+        }
+        // Usage statistics: which option of a fence the page set, never its value. A dragged
+        // slider counts once, at its release.
+        if !is_live_tick(v) {
+            pecofence_core::usage::event_named("settings.fence", prop);
+        }
+        self.push_settings_state();
+    }
+
+    /// Applies one parsed property to `fence` (window-level ones act on its host, see the
+    /// module docs). Returns whether the persisted state actually changed.
+    pub(super) fn apply_fence_prop(&mut self, fence: FenceId, prop: FenceProp) -> bool {
+        let host = self.state.host_of(fence);
+        let before = (
+            self.state.fence(fence).cloned(),
+            self.state.fence(host).cloned(),
+        );
+        match prop {
+            // Tool data lives beside the fence (`Config::notes`, `Config::scripts`).
+            FenceProp::NoteText(text) => {
+                let changed = self.state.set_note_text(fence, &text);
+                if changed {
+                    self.push_note(fence);
+                    self.schedule_save();
+                }
+                return changed;
+            }
+            FenceProp::ScriptPath(path) => return self.set_script_path(fence, &path),
+            FenceProp::Smart(change) => return self.change_smart(fence, change),
+            FenceProp::VirtualDesktops(specs) => {
+                return match self.resolve_desktop_specs(&specs) {
+                    Ok(keys) => self.set_fence_desktops(fence, keys, "settings or CLI"),
+                    Err(error) => {
+                        tracing::warn!(%error, "virtual desktops not set");
+                        false
+                    }
+                };
+            }
+            FenceProp::ScriptInterval(minutes) => {
+                let old = self
+                    .state
+                    .config
+                    .scripts
+                    .get(&fence)
+                    .map(|s| s.interval_minutes);
+                self.set_script_interval(fence, minutes);
+                return old != Some(minutes) && old.is_some();
+            }
+            FenceProp::Title(title) => {
+                self.state.rename_fence(fence, &title);
+                self.refresh_fence(fence);
+                if let Some(w) = self.window_for(fence) {
+                    w.redraw();
+                }
+                self.schedule_save();
+                self.smart_editor_fence_changed(fence);
+            }
+            FenceProp::IconSize(size) => self.apply_icon_size(fence, size),
+            FenceProp::Spacing(spacing) => self.set_fence_spacing(fence, spacing),
+            FenceProp::IconAlign(align) => self.set_fence_icon_align(fence, align),
+            FenceProp::AutoHeight(on) => self.set_fence_auto_height(fence, on),
+            FenceProp::Locked(on) => self.set_fence_locked(fence, on),
+            FenceProp::ExpandUpward(on) => self.set_fence_expand_upward(fence, on),
+            FenceProp::ExcludeFromQuickHide(on) => self.set_fence_quick_hide_excluded(fence, on),
+            FenceProp::Opacity(op) => self.set_fence_opacity(fence, op),
+            FenceProp::Tint(tint) => self.set_fence_tint(fence, tint),
+            FenceProp::TintTitleOnly(on) => self.set_fence_tint_title_only(fence, on),
+            FenceProp::TabColor(rgb) => self.set_fence_tab_color(fence, rgb),
+            FenceProp::TitleColor(choice) => {
+                let (tint, _, _) = self.style_of(host);
+                let (_, _, title_size) = self.style_of(fence);
+                let title_rgb = match choice {
+                    TitleColorChoice::Theme => None,
+                    TitleColorChoice::Tint => tint,
+                    TitleColorChoice::Rgb(rgb) => Some(rgb),
+                };
+                self.set_fence_title_style(fence, title_rgb, title_size);
+            }
+            FenceProp::TitleSize(size) => {
+                let (_, title_rgb, _) = self.style_of(fence);
+                self.set_fence_title_style(fence, title_rgb, size);
+            }
+            FenceProp::TextSize(size) => self.set_fence_text_size(fence, size),
+            FenceProp::TitleOnHover(on) => self.set_fence_title_on_hover(fence, on),
+            FenceProp::TransparentOnHover(on) => self.set_fence_transparent_on_hover(fence, on),
+            FenceProp::OpenFoldersInside(on) => self.set_fence_open_folders_inside(fence, on),
+            FenceProp::PortalNavigate(on) => self.set_fence_portal_navigate(fence, on),
+            FenceProp::PortalTitleIcon(on) => self.set_fence_title_icon(fence, on),
+            FenceProp::HideWhenEmpty(on) => self.set_fence_hide_when_empty(fence, on),
+            FenceProp::DesktopLayout(on) => {
+                self.set_fence_desktop_layout(fence, on, "settings or CLI")
+            }
+            FenceProp::FreePlacement(on) => {
+                self.set_fence_free_placement(fence, on, "settings or CLI")
+            }
+            FenceProp::Layout(layout) => {
+                // Same steps as the fence menu's 视图 items.
+                self.state.set_layout(fence, layout);
+                self.show_grid(fence);
+                self.apply_cell_snap(fence);
+                self.apply_auto_height(fence);
+                self.schedule_save();
+            }
+            FenceProp::Sort(sort) => {
+                self.state.set_sort(fence, sort);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            FenceProp::Reverse(on) => {
+                self.state.set_reverse(fence, on);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            FenceProp::GroupByDate(on) => {
+                self.state.set_group_by_date(fence, on);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            FenceProp::FoldersFirst(on) => {
+                self.state.set_folders_first(fence, on);
+                self.refresh_fence(fence);
+                self.schedule_save();
+            }
+            FenceProp::LabelLines(lines) => {
+                if let Some(f) = self.state.fence_mut(fence)
+                    && f.view.label_lines != lines
+                {
+                    f.view.label_lines = lines;
+                    self.state.mark_dirty();
+                }
+                self.show_grid(fence);
+                self.apply_cell_snap(fence);
+                self.fit_height_to_content(fence);
+                self.apply_auto_height(fence);
+                self.schedule_save();
+            }
+        }
+        let after = (
+            self.state.fence(fence).cloned(),
+            self.state.fence(host).cloned(),
+        );
+        before != after
+    }
+}

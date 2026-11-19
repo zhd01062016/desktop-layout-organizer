@@ -1,0 +1,302 @@
+//! Lifecycle, app-posted and shell messages.
+
+use super::*;
+
+// SHDoDragDrop asks the source window for its drag image before the drag
+// starts: answer with the selected items rendered as they are on screen so
+// the translucent copy lifts off from their own places (Explorer's DefView).
+// 0 = the shell falls back to its generic image.
+pub(super) fn on_getdragimage(
+    h: &HandlerCtx,
+    _hwnd: HWND,
+    _wparam: usize,
+    lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { view, .. } = h;
+    if lparam == 0 {
+        return Some(0);
+    }
+    let image = {
+        let Ok(guard) = view.try_borrow() else {
+            return Some(0);
+        };
+        match guard.as_ref() {
+            Some(v) if v.ole_drag => v.render_drag_image(),
+            _ => None,
+        }
+    };
+    match image {
+        Some(img) => {
+            // SAFETY: lparam is the SHDRAGIMAGE* of this DI_GETDRAGIMAGE message.
+            let answered = unsafe { dragdrop::answer_drag_image(lparam, &img) };
+            // The drop then knows each icon's picture is at its own place (`note_drop_landing`).
+            INTERNAL_DRAG.with(|d| {
+                if let Some(d) = d.borrow_mut().as_mut() {
+                    d.in_place = answered;
+                }
+            });
+            Some(answered as isize)
+        }
+        None => Some(0),
+    }
+}
+
+pub(super) fn on_showwindow(
+    h: &HandlerCtx,
+    hwnd: HWND,
+    wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { view, .. } = h;
+    // State under the borrow; the shadow's ShowWindow after it.
+    let (shadow, show) = {
+        let mut guard = view.borrow_mut();
+        let v = guard.as_mut()?;
+        // A clock hidden for a while shows the time now, not the one from when it went.
+        if wparam != 0 && v.clock.is_some() && !v.rolled_up {
+            let _ = v.redraw_content();
+        }
+        if wparam != 0 {
+            // A fade-in shows the shadow itself (`show_with_fade`, at
+            // alpha 0, fading with the plate).
+            if v.vis_fade == Some(VisFade::Showing) {
+                return None;
+            }
+            v.reset_root();
+            (v.shadow.hwnd(), true)
+        } else {
+            // Hidden (possibly from outside, mid-fade): a stale completion
+            // must not show the shadow of a hidden window — and a retiring
+            // window whose exit fade was cut short still has to be dropped.
+            if v.vis_fade.take() == Some(VisFade::Hiding { destroy: true }) {
+                v.queue.push(Command::FadeOutDone(hwnd));
+            }
+            // Transparent while hidden, so the first frame of the next
+            // fade-in is too; a plain ShowWindow makes it opaque above.
+            v.rest_hidden();
+            (v.shadow.hwnd(), false)
+        }
+    };
+    if show {
+        show_shadow(shadow, hwnd);
+    } else {
+        desktop::hide_window(shadow);
+    }
+    None
+}
+
+pub(super) fn on_app_set_visible(
+    h: &HandlerCtx,
+    hwnd: HWND,
+    wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { view, .. } = h;
+    // Desktop anchor (quick hide / show, Peek): fade rather than snap.
+    if wparam != 0 {
+        show_with_fade(view, hwnd, false);
+    } else {
+        hide_with_fade(view, hwnd, false, false);
+    }
+    Some(1)
+}
+
+pub(super) fn on_app_tab_swap_done(
+    h: &HandlerCtx,
+    _hwnd: HWND,
+    wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { view, .. } = h;
+    if let Some(v) = view.borrow_mut().as_mut()
+        && v.swap_gen == wparam
+    {
+        v.finish_content_swap_now();
+    }
+    Some(0)
+}
+
+/// 像桌面一样排列: applies the shape the view left (`sync_desktop_shape`), with no borrow held.
+pub(super) fn on_app_desktop_shape(
+    h: &HandlerCtx,
+    hwnd: HWND,
+    _wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let shape = h.view.try_borrow_mut().ok().and_then(|mut g| {
+        g.as_mut()
+            .filter(|v| v.bare())
+            .and_then(|v| v.desktop_shape_pending.take())
+    });
+    if let Some(shape) = shape {
+        window::set_window_region(hwnd, Some(&shape));
+    }
+    Some(0)
+}
+
+pub(super) fn on_app_tab_rail(
+    h: &HandlerCtx,
+    _hwnd: HWND,
+    _wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { view, .. } = h;
+    let rail = view
+        .try_borrow()
+        .ok()
+        // -1: a fence arranged like the desktop (像桌面一样排列) or a note takes no merge.
+        .and_then(|g| {
+            g.as_ref().map(|v| {
+                if v.bare() || v.shows_tool() {
+                    -1
+                } else {
+                    v.content_x
+                }
+            })
+        })
+        .unwrap_or(0);
+    Some(rail as isize)
+}
+
+/// `lparam` of a fade completion that the fallback timer delivered (the compositor's is 0).
+pub(super) const FADE_DONE_BY_TIMER: isize = 1;
+
+pub(super) fn on_app_fade_done(
+    h: &HandlerCtx,
+    hwnd: HWND,
+    wparam: usize,
+    lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { view, .. } = h;
+    // Compositor batch completed (posted from its callback thread). State
+    // under the borrow; ShowWindow on the fence / shadow after it.
+    let (shadow, hide) = {
+        let mut guard = view.borrow_mut();
+        let Some(v) = guard.as_mut() else {
+            return Some(0);
+        };
+        if v.vis_gen != wparam {
+            tracing::debug!(
+                title = %v.title,
+                generation = wparam,
+                current = v.vis_gen,
+                "fade completion of a replaced fade ignored"
+            );
+            return Some(0);
+        }
+        window::kill_timer(hwnd, TIMER_VISIBILITY_FINISH);
+        v.vis_deadline = None;
+        let trace = std::mem::take(&mut v.fade_trace);
+        if let Some(fade) = v.vis_fade {
+            tracing::debug!(
+                title = %v.title,
+                generation = wparam,
+                ?fade,
+                ms = trace.elapsed_ms(),
+                by = if lparam == FADE_DONE_BY_TIMER {
+                    "fallback timer"
+                } else {
+                    "compositor"
+                },
+                shadow_steps = trace.shadow_steps,
+                max_step_gap_ms = trace.max_step_gap_ms,
+                shadow_alpha = v.shadow.alpha(),
+                zorder_moves = trace.zorder_moves,
+                "fade finished"
+            );
+        }
+        match v.vis_fade.take() {
+            None => return Some(0),
+            Some(VisFade::Showing) => {
+                v.reset_root();
+                // A fence just made: its name box opens now (a request older than any
+                // fade-in is one whose fade never reported and is dropped).
+                if let Some(asked) = v.rename_after_fade.take() {
+                    let waited = asked.elapsed();
+                    let open = waited < Duration::from_secs(2);
+                    tracing::debug!(
+                        title = %v.title,
+                        waited_ms = waited.as_millis() as u64,
+                        open,
+                        "new fence faded in: name box"
+                    );
+                    if open {
+                        v.queue.push(Command::BeginFenceRename(h.fence_id));
+                    }
+                }
+                (v.shadow.hwnd(), None)
+            }
+            Some(VisFade::Hiding { destroy }) => {
+                // Hidden again before it had faded in: no name box.
+                v.rename_after_fade = None;
+                (v.shadow.hwnd(), Some((destroy, v.queue.clone())))
+            }
+        }
+    };
+    let Some((destroy, queue)) = hide else {
+        if desktop::is_visible(hwnd) {
+            show_shadow(shadow, hwnd);
+        }
+        return Some(0);
+    };
+    desktop::hide_window(hwnd);
+    desktop::hide_window(shadow);
+    if let Some(v) = view.borrow_mut().as_mut() {
+        // At rest while hidden (see `rest_hidden`).
+        v.rest_hidden();
+    }
+    if destroy {
+        queue.push(Command::FadeOutDone(hwnd));
+    }
+    Some(0)
+}
+
+pub(super) fn on_taskbar_created(
+    h: &HandlerCtx,
+    _hwnd: HWND,
+    _wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { anchor, .. } = h;
+    if let Ok(mut guard) = anchor.try_borrow_mut()
+        && let Some(a) = guard.as_mut()
+    {
+        a.reanchor("TaskbarCreated");
+    }
+    Some(0)
+}
+
+// The session ends while a menu of this fence is open: Windows cancels the menu and ends the
+// process as soon as the menu window is gone, before WM_ENDSESSION and often before
+// WM_QUERYENDSESSION. The real desktop icons come back first.
+pub(super) fn on_cancelmode(
+    h: &HandlerCtx,
+    _hwnd: HWND,
+    _wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { anchor, .. } = h;
+    if window::session_ending()
+        && let Ok(mut guard) = anchor.try_borrow_mut()
+        && let Some(a) = guard.as_mut()
+    {
+        tracing::info!("session ending with a menu open");
+        a.release_desktop_icons();
+    }
+    None
+}
+
+pub(super) fn on_destroy(
+    h: &HandlerCtx,
+    hwnd: HWND,
+    _wparam: usize,
+    _lparam: isize,
+) -> Option<isize> {
+    let HandlerCtx { anchor, .. } = h;
+    if let Ok(mut guard) = anchor.try_borrow_mut()
+        && let Some(a) = guard.as_mut()
+    {
+        a.unregister_fence(hwnd);
+    }
+    Some(0)
+}

@@ -1,0 +1,749 @@
+//! Selection, keyboard cursor, type-ahead, marquee, press / hover bookkeeping, activation colour state and the slow-double-click rename.
+
+use super::*;
+
+/// A press on an item that may become a drag (OLE drag once the threshold is crossed).
+pub(super) struct DragState {
+    pub(super) start: (i32, i32),
+    pub(super) item: usize,
+    /// Plain press on an already-selected item of a multi-selection: a release that never
+    /// became a drag collapses the selection to this item (Explorer).
+    pub(super) collapse_on_up: bool,
+    /// The pressed item was the sole selected item before the press: a release on its label
+    /// arms the slow-double-click rename.
+    pub(super) was_sole_selected: bool,
+    /// Ctrl press on an already-selected item: a release that never became a drag deselects
+    /// it; a drag carries the whole selection (Explorer's Ctrl+drag copy).
+    pub(super) deselect_on_up: bool,
+    /// Plain press with Explorer's single-click open on: a release that never became a drag
+    /// opens the item.
+    pub(super) open_on_up: bool,
+}
+
+/// What a left press on item `i` did to the selection, for the release.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ItemPress {
+    pub(super) collapse_on_up: bool,
+    pub(super) was_sole_selected: bool,
+    pub(super) deselect_on_up: bool,
+}
+
+/// Explorer's press rules on item `i`: Shift = range from the anchor (added to the selection
+/// with Ctrl), Ctrl = toggle, plain = select it unless it is already selected (a plain press
+/// keeps a multi-selection for dragging and collapses it on a release without a drag). Ctrl
+/// on a selected item toggles it off only on a release without a drag ([`release_item`]).
+pub(super) fn press_item(
+    selected: &mut HashSet<usize>,
+    range_anchor: &mut Option<usize>,
+    i: usize,
+    shift: bool,
+    ctrl: bool,
+) -> ItemPress {
+    let plain = !shift && !ctrl && selected.contains(&i);
+    let press = ItemPress {
+        collapse_on_up: plain && selected.len() > 1,
+        was_sole_selected: plain && selected.len() == 1,
+        deselect_on_up: ctrl && !shift && selected.contains(&i),
+    };
+    if shift && let Some(a) = *range_anchor {
+        let (lo, hi) = (a.min(i), a.max(i));
+        if !ctrl {
+            selected.clear();
+        }
+        selected.extend(lo..=hi);
+    } else if ctrl {
+        selected.insert(i);
+        *range_anchor = Some(i);
+    } else if !selected.contains(&i) {
+        selected.clear();
+        selected.insert(i);
+        *range_anchor = Some(i);
+    }
+    press
+}
+
+/// The pointer rested on item `i` with Explorer's single-click open on (the desktop list
+/// view's hover select): Shift = range from the anchor (added with Ctrl), Ctrl = toggle,
+/// plain = select it alone unless it is already selected. Returns whether the selection
+/// changed.
+pub(super) fn hover_item(
+    selected: &mut HashSet<usize>,
+    range_anchor: &mut Option<usize>,
+    i: usize,
+    shift: bool,
+    ctrl: bool,
+) -> bool {
+    let before = selected.clone();
+    if shift && let Some(a) = *range_anchor {
+        if !ctrl {
+            selected.clear();
+        }
+        selected.extend(a.min(i)..=a.max(i));
+    } else if ctrl {
+        if !selected.remove(&i) {
+            selected.insert(i);
+        }
+        *range_anchor = Some(i);
+    } else if !selected.contains(&i) {
+        selected.clear();
+        selected.insert(i);
+        *range_anchor = Some(i);
+    }
+    *selected != before
+}
+
+/// The button came up on `i` without a drag: finish a Ctrl toggle-off.
+pub(super) fn release_item(selected: &mut HashSet<usize>, i: usize, press: ItemPress) {
+    if press.deselect_on_up {
+        selected.remove(&i);
+    }
+}
+
+/// The drag threshold was crossed on `item`: a drag carries the selection it belongs to, or
+/// just `item` when it is not selected.
+pub(super) fn drag_selection(selected: &mut HashSet<usize>, item: usize) {
+    if !selected.contains(&item) {
+        selected.clear();
+        selected.insert(item);
+    }
+}
+
+/// The control the mouse button is held on. Items and tabs act on press (selection / switch,
+/// as in Explorer); the up button, the roll-up chevron, header cells, a note's check boxes
+/// (by line) and a script fence's clickable rows (by row) are buttons that fire on release
+/// inside the same control and show the WinUI pressed fill meanwhile; so is a web address
+/// in a note (by line and start).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PressTarget {
+    Item(usize),
+    Tab(usize),
+    Header(DetailColumn),
+    Up,
+    Chevron,
+    NoteBox(usize),
+    NoteLink(usize, usize),
+    ScriptRow(usize),
+}
+
+/// How a keyboard navigation key moves the cursor (Explorer): plain = select the target,
+/// Shift = extend the range from the anchor, Ctrl = move the focus only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CursorMode {
+    Select,
+    Extend,
+    FocusOnly,
+}
+
+/// Keys that act on the items of a fence (its selection or its keyboard cursor): the arrows,
+/// Home / End, PageUp / PageDown, Enter, F2, Delete, and Ctrl with A, C, D, X or Space. A
+/// rolled-up fence ignores them; Tab, Ctrl+Tab, Ctrl+Z, Ctrl+V, Ctrl+F, F5 and Esc stay.
+pub(super) fn acts_on_items(vk: u32, ctrl: bool) -> bool {
+    // 0x21..=0x28: PageUp, PageDown, End, Home, Left, Up, Right, Down.
+    matches!(vk, 0x21..=0x28)
+        || vk == msg::VK_RETURN
+        || vk == msg::VK_F2
+        || vk == msg::VK_DELETE
+        // A, C, D, X, Space.
+        || (ctrl && matches!(vk, 0x41 | 0x43 | 0x44 | 0x58 | 0x20))
+}
+
+pub(super) fn cursor_mode(shift: bool, ctrl: bool) -> CursorMode {
+    if shift {
+        CursorMode::Extend
+    } else if ctrl {
+        CursorMode::FocusOnly
+    } else {
+        CursorMode::Select
+    }
+}
+
+/// Apply a keyboard move without involving rendering. A Shift range keeps its original
+/// anchor even when it began after a focus-only move into an unselected view.
+pub(super) fn apply_cursor_selection(
+    selected: &mut HashSet<usize>,
+    anchor: &mut Option<usize>,
+    range_anchor: &mut Option<usize>,
+    next: usize,
+    mode: CursorMode,
+) {
+    match mode {
+        CursorMode::Extend => {
+            let from = range_anchor.or(*anchor).unwrap_or(next);
+            *range_anchor = Some(from);
+            *selected = (from.min(next)..=from.max(next)).collect();
+        }
+        CursorMode::FocusOnly => {}
+        CursorMode::Select => {
+            selected.clear();
+            selected.insert(next);
+            *range_anchor = Some(next);
+        }
+    }
+    *anchor = Some(next);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MarqueeMode {
+    Replace,
+    /// Shift: add to the existing selection.
+    Add,
+    /// Ctrl: toggle the banded items.
+    Toggle,
+}
+
+/// Rubber-band selection inside one fence (plan §5.9: MVP marquee is per fence).
+pub(super) struct MarqueeState {
+    /// Window px at press; anchored to the content via `start_scroll`.
+    pub(super) start: (i32, i32),
+    pub(super) start_scroll: f32,
+    pub(super) cur: (i32, i32),
+    /// Last raw pointer position (capture is held, so moves arrive while outside the window);
+    /// `cur` is clamped to the item band while auto-scrolling, this one is not.
+    pub(super) pointer: (i32, i32),
+    /// Previous auto-scroll frame while the pointer is outside the item area (None = not
+    /// auto-scrolling).
+    pub(super) auto_last: Option<Instant>,
+    /// Selection when the drag began (Shift / Ctrl modes).
+    pub(super) base: HashSet<usize>,
+    pub(super) mode: MarqueeMode,
+}
+
+impl FenceViewState {
+    /// Moves the keyboard cursor to `next`: selecting it, extending the range from the anchor
+    /// (Shift) or moving the focus alone (Ctrl); shows the focus ring and scrolls into view.
+    pub(super) fn cursor_to(&mut self, next: usize, mode: CursorMode) {
+        apply_cursor_selection(
+            &mut self.selected,
+            &mut self.anchor_index,
+            &mut self.range_anchor,
+            next,
+            mode,
+        );
+        self.focus_visible = true;
+        self.scroll_into_view(next, true);
+        self.tip_keyboard_focus(Some(next));
+    }
+
+    /// Ctrl+Space: toggles the focused item's membership in the selection.
+    pub(super) fn toggle_focused(&mut self) {
+        let Some(a) = self.anchor_index.filter(|a| *a < self.items.len()) else {
+            return;
+        };
+        if !self.selected.remove(&a) {
+            self.selected.insert(a);
+        }
+        self.range_anchor = Some(a);
+        self.focus_visible = true;
+    }
+
+    /// Space: the focused item joins the selection when it is not selected yet (File Explorer
+    /// keeps what was selected). Returns whether it did (false: no focus, or the focused item
+    /// is already selected).
+    pub(super) fn select_focused(&mut self) -> bool {
+        let Some(a) = self.anchor_index.filter(|a| *a < self.items.len()) else {
+            return false;
+        };
+        if self.rolled_up || !self.selected.insert(a) {
+            return false;
+        }
+        self.range_anchor = Some(a);
+        self.focus_visible = true;
+        true
+    }
+
+    /// Moves the selection anchor by (dx, dy) cells (see [`CursorMode`]).
+    pub(super) fn move_cursor(&mut self, dx: i32, dy: i32, mode: CursorMode) {
+        if self.items.is_empty() {
+            return;
+        }
+        let scale = self.scale();
+        let (cw, _) = self.content_size_px();
+        let layout = self.layout(cw as f32 / scale);
+        let n = self.items.len();
+        let cur = match self.anchor_index {
+            Some(i) => i.min(n - 1),
+            None => {
+                self.cursor_to(0, mode);
+                return;
+            }
+        };
+        // Rows step to the nearest column of the row above / below, across "按时间分组"
+        // headers; no wrap between rows.
+        let next = layout.neighbour(cur, dx, dy, n).unwrap_or(cur);
+        self.cursor_to(next, mode);
+    }
+
+    pub(super) fn select_only(&mut self, index: usize) {
+        self.selected.clear();
+        self.selected.insert(index);
+        self.anchor_index = Some(index);
+        self.range_anchor = Some(index);
+    }
+
+    /// Ends a marquee (button release, capture loss, Esc), returning whether one was running.
+    /// Releasing while the band was still edge-auto-scrolling leaves the offset between
+    /// pixels, so it snaps here; the caller's redraw paints the snapped offset.
+    pub(super) fn end_marquee(&mut self) -> bool {
+        let Some(m) = self.marquee.take() else {
+            return false;
+        };
+        self.focus_after_marquee(&m);
+        self.snap_scroll();
+        true
+    }
+
+    /// The keyboard goes on from a rectangle selection: the focus and the Shift anchor move to
+    /// the selected item nearest to where the rectangle began, as in File Explorer (there,
+    /// Down after a rectangle drawn from file 3 to file 6 selects file 4). They stayed on the
+    /// item that had the focus before, often none, so the next arrow key started at the first
+    /// icon of the fence. A rectangle that selected nothing leaves them alone.
+    fn focus_after_marquee(&mut self, m: &MarqueeState) {
+        if self.selected.is_empty() {
+            return;
+        }
+        let scale = self.scale();
+        let (layout, _) = self.scroll_extent();
+        // Where the rectangle began, in unscrolled content DIPs (as `marquee_rect_dip`).
+        let x = (m.start.0 - self.content_x) as f32 / scale;
+        let y = (m.start.1 - self.content_y) as f32 / scale - layout.fixed_top() + m.start_scroll;
+        let away = |i: usize| {
+            let c = layout.cell(i);
+            let dx = (c.x - x).max(x - (c.x + c.w)).max(0.0);
+            let dy = (c.y - y).max(y - (c.y + c.h)).max(0.0);
+            dx * dx + dy * dy
+        };
+        let nearest = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|i| *i < self.items.len())
+            .min_by(|a, b| away(*a).total_cmp(&away(*b)).then(a.cmp(b)));
+        if let Some(i) = nearest {
+            tracing::debug!(
+                selected = self.selected.len(),
+                focus = i,
+                "rectangle selection ended: the focus goes to the item nearest to its start"
+            );
+            self.anchor_index = Some(i);
+            self.range_anchor = Some(i);
+        }
+    }
+
+    /// PageUp / PageDown: moves the anchor one viewport of rows (same column), scrolling a
+    /// whole page; Shift extends the range, Ctrl moves the focus only. Clamps to the first /
+    /// last item.
+    pub(super) fn page_cursor(&mut self, dir: i32, mode: CursorMode) {
+        if self.items.is_empty() {
+            return;
+        }
+        let (layout, view_h) = self.scroll_extent();
+        let rows_per_page = ((view_h / layout.row_step()).floor() as i32).max(1);
+        let n = self.items.len();
+        let cur = match self.anchor_index {
+            Some(i) => i.min(n - 1),
+            None => {
+                let t = if dir > 0 { 0 } else { n - 1 };
+                self.cursor_to(t, mode);
+                return;
+            }
+        };
+        // A whole page of rows when there is one; the first / last item otherwise.
+        let target = layout
+            .neighbour(cur, 0, dir * rows_per_page, n)
+            .unwrap_or(if dir > 0 { n - 1 } else { 0 });
+        // One viewport of rows, animated; `cursor_to` then only retargets if the item still
+        // ends up outside the destination viewport.
+        let page = dir as f32 * rows_per_page as f32 * layout.row_step();
+        self.scroll_to(self.scroll_target() + page, motion::SLOW);
+        self.cursor_to(target, mode);
+    }
+
+    /// Characters typed within the timeout form a prefix: a space typed now belongs to it.
+    pub(super) fn typing_ahead(&self) -> bool {
+        !self.type_ahead.is_empty()
+            && self
+                .type_ahead_at
+                .is_some_and(|t| t.elapsed() <= TYPE_AHEAD_TIMEOUT)
+    }
+
+    /// The file Space previews in Seer or QuickLook: the focused item when it is selected
+    /// (Explorer), else the first selected one.
+    pub(super) fn preview_path(&self) -> Option<&std::path::Path> {
+        if self.rolled_up {
+            return None;
+        }
+        let idx = self
+            .anchor_index
+            .filter(|i| self.selected.contains(i))
+            .or_else(|| self.selected.iter().min().copied())?;
+        self.items.get(idx).map(|it| it.path.as_path())
+    }
+
+    /// Type-to-select (Explorer ListView): characters typed within ~1 s form a prefix; the next
+    /// item (cyclically from the anchor) whose name starts with it is selected and scrolled into
+    /// view. One letter pressed repeatedly cycles through the items starting with it; a longer
+    /// prefix stays on the current item while it still matches. Returns true when the selection
+    /// moved.
+    pub(super) fn type_ahead_char(&mut self, ch: char) -> bool {
+        if self.items.is_empty() || self.rolled_up {
+            return false;
+        }
+        if self
+            .type_ahead_at
+            .is_none_or(|t| t.elapsed() > TYPE_AHEAD_TIMEOUT)
+        {
+            self.type_ahead.clear();
+        }
+        self.type_ahead_at = Some(Instant::now());
+        if self.type_ahead.is_empty() && ch == ' ' {
+            return false;
+        }
+        self.type_ahead.push(ch);
+        let lower = self.type_ahead.to_lowercase();
+        let first = lower.chars().next().unwrap_or(ch);
+        let single = lower.chars().count() == 1;
+        let repeated = !single && lower.chars().all(|c| c == first);
+        let n = self.items.len();
+        let (needle, start) = if single || repeated {
+            (
+                first.to_string(),
+                self.anchor_index.map_or(0, |a| (a + 1) % n),
+            )
+        } else {
+            (lower, self.anchor_index.unwrap_or(0).min(n - 1))
+        };
+        for k in 0..n {
+            let i = (start + k) % n;
+            if self.items[i].name.to_lowercase().starts_with(&needle) {
+                self.cursor_to(i, CursorMode::Select);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The content moved under a (possibly stationary) pointer — a glide ended or the offset
+    /// snapped — so the item under it and the cursor must follow (the infotip waits for a real
+    /// pointer move, see `tip_move_at`). Posts a
+    /// synthetic WM_MOUSEMOVE at the pointer's current client position: the full hover / tip /
+    /// cursor logic then re-runs from the message loop instead of being duplicated here.
+    /// `PostMessage` is asynchronous, so this is safe under the borrow and from `tick`
+    /// (`hide_tip` is not: TTM_TRACKACTIVATE is a SendMessage). Skipped while a gesture owns
+    /// the pointer, as those branches track the offset themselves, and while Windows' size or
+    /// move loop runs: that loop reads a posted WM_MOUSEMOVE as a pointer position on the
+    /// screen, so a refresh posted when icons finished gliding after a column change made the
+    /// held edge jump to another width and back, about five times a second.
+    pub(super) fn request_hover_refresh(&self) {
+        if !self.mouse_inside
+            || self.marquee.is_some()
+            || self.drag.is_some()
+            || self.ole_drag
+            || self.scrollbar_pressed()
+            || self
+                .behavior
+                .size_move
+                .try_borrow()
+                .map_or(true, |s| s.is_some())
+        {
+            return;
+        }
+        let pt = window::screen_to_client(self.hwnd, window::cursor_pos());
+        window::post_message(
+            self.hwnd,
+            msg::WM_MOUSEMOVE,
+            0,
+            msg::make_lparam(pt.x, pt.y),
+        );
+    }
+
+    /// Cancels an armed slow-double-click rename.
+    pub(super) fn cancel_pending_rename(&mut self) {
+        if self.pending_rename.take().is_some() {
+            window::kill_timer(self.hwnd, TIMER_RENAME);
+        }
+    }
+
+    pub(super) fn selected_paths(&self) -> Vec<PathBuf> {
+        let mut v: Vec<usize> = self.selected.iter().copied().collect();
+        v.sort_unstable();
+        v.into_iter()
+            .filter_map(|i| self.items.get(i).map(|it| it.path.clone()))
+            .collect()
+    }
+
+    /// Redraws the surface that shows `p`'s pressed look.
+    pub(super) fn redraw_for_press(&mut self, p: PressTarget) {
+        match p {
+            PressTarget::Item(_)
+            | PressTarget::Header(_)
+            | PressTarget::NoteBox(_)
+            | PressTarget::NoteLink(..)
+            | PressTarget::ScriptRow(_) => {
+                if !self.rolled_up {
+                    let _ = self.redraw_content();
+                }
+            }
+            PressTarget::Tab(_) | PressTarget::Up | PressTarget::Chevron => {
+                let _ = self.redraw_chrome_only();
+            }
+        }
+    }
+
+    /// Button-down on one of the release-fired controls (up button, chevron, header cell):
+    /// records the press and paints it. The caller takes the mouse capture afterwards (with no
+    /// borrow held) so the release always arrives here.
+    pub(super) fn press_button_at(&mut self, x_px: i32, y_px: i32) -> Option<PressTarget> {
+        let p = if self.up_button_at(x_px, y_px) {
+            PressTarget::Up
+        } else if self.chevron_at(x_px, y_px) {
+            PressTarget::Chevron
+        } else if self.divider_hit(x_px, y_px).is_none()
+            && let Some(col) = self.header_hit(x_px, y_px)
+        {
+            PressTarget::Header(col)
+        } else {
+            return None;
+        };
+        self.pressed = Some(p);
+        self.press_inside = true;
+        self.press_origin = (x_px, y_px);
+        self.redraw_for_press(p);
+        Some(p)
+    }
+
+    /// Button-down on a note's check box or on a script fence's clickable row: like the
+    /// buttons above, they show the press and act on a release over the same control, so a
+    /// press can be taken back by sliding off. `second` is the second press of a
+    /// double-click, which a script row does not take (a link opens once). The caller takes
+    /// the mouse capture.
+    pub(super) fn press_tool_at(
+        &mut self,
+        x_px: i32,
+        y_px: i32,
+        second: bool,
+    ) -> Option<PressTarget> {
+        let p = if let Some(line) = self.note_box_at(x_px, y_px) {
+            PressTarget::NoteBox(line)
+        } else if let Some((line, start)) = self.note_link_at(x_px, y_px).filter(|_| !second) {
+            PressTarget::NoteLink(line, start)
+        } else {
+            let row = self.script_row_at(x_px, y_px).filter(|_| !second)?;
+            PressTarget::ScriptRow(row)
+        };
+        tracing::debug!(fence = %self.active, target = ?p, second, "tool control pressed");
+        self.pressed = Some(p);
+        self.press_inside = true;
+        self.press_origin = (x_px, y_px);
+        self.redraw_for_press(p);
+        Some(p)
+    }
+
+    /// Takes the pressed control without repainting: the caller folds the repaint into its own
+    /// single redraw of the affected surface.
+    pub(super) fn take_pressed(&mut self) -> Option<(PressTarget, bool)> {
+        let p = self.pressed.take()?;
+        let inside = std::mem::replace(&mut self.press_inside, false);
+        Some((p, inside))
+    }
+
+    /// Clears a pressed control (capture loss, Esc), repainting it at rest.
+    pub(super) fn clear_pressed(&mut self) -> Option<(PressTarget, bool)> {
+        let r = self.take_pressed()?;
+        self.redraw_for_press(r.0);
+        Some(r)
+    }
+
+    /// Activation state for the selection colour (accent while active, neutral otherwise).
+    /// Returns true when the content surface shows the change and needs a redraw (the caller
+    /// folds it into its own redraw so a click rasterises the content once).
+    #[must_use]
+    pub(super) fn set_active(&mut self, on: bool) -> bool {
+        if self.win_active == on {
+            return false;
+        }
+        self.win_active = on;
+        let to = if on { 0.0 } else { 1.0 };
+        let now = Instant::now();
+        tracing::debug!(
+            fence = %self.fence_id,
+            on,
+            selected = self.selected.len(),
+            "fence active state changed: selection colour"
+        );
+        if self.selected.is_empty() || !self.motion.enabled() {
+            self.snap_selection_colour(to, now);
+        } else {
+            self.selection_inactive
+                .retarget(to, motion::FAST, Curve::Linear, now);
+        }
+        !self.selected.is_empty() && !self.rolled_up
+    }
+
+    /// Drops the selection (and the Shift-range / keyboard anchors) when the user clicks the
+    /// desktop or another fence, so no item stays highlighted in a fence the user has left.
+    /// Returns true when something was selected and the content needs a redraw.
+    #[must_use]
+    pub(super) fn end_selection(&mut self) -> bool {
+        let had = !self.selected.is_empty();
+        self.selected.clear();
+        self.anchor_index = None;
+        self.range_anchor = None;
+        had && !self.rolled_up
+    }
+
+    /// Pointer-initiated activation. Explorer processes WM_MOUSEACTIVATE / focus before the
+    /// button message, so a clicked item is accent on its first frame; the 167 ms cross-fade
+    /// is reserved for WM_ACTIVATE-driven changes (focus leaving / returning without a click).
+    /// Returns true when the content surface shows the change and needs a redraw.
+    #[must_use]
+    pub(super) fn activate_by_pointer(&mut self) -> bool {
+        let now = Instant::now();
+        let changed = !self.win_active
+            || !self.selection_inactive.is_done(now)
+            || self.selection_inactive.target() != 0.0;
+        self.win_active = true;
+        self.snap_selection_colour(0.0, now);
+        changed && !self.selected.is_empty() && !self.rolled_up
+    }
+
+    /// The selection takes the colour `to` (0 accent, 1 neutral) without a cross-fade. A
+    /// selection that was just ended is still on screen while it fades out (83 ms): it keeps
+    /// the colour it had, and the new colour comes when it is gone. A click on the desktop
+    /// ended the selection of a fence without the keyboard and made the fence active in the
+    /// same moment: the fading grey box turned accent, a bright flash of two frames.
+    fn snap_selection_colour(&mut self, to: f32, now: Instant) {
+        let from = self.selection_inactive.value_at(now);
+        let leaving =
+            self.selected.is_empty() && self.motion.enabled() && !self.item_sel.is_empty();
+        self.selection_inactive = if leaving && (from - to).abs() > 0.01 {
+            tracing::debug!(
+                fence = %self.fence_id,
+                from,
+                to,
+                "selection colour waits for the ended selection to fade out"
+            );
+            // Starts when the fade-out is over and is done a moment later.
+            Tween::new(
+                from,
+                to,
+                Duration::from_millis(1),
+                Curve::Linear,
+                now + motion::FASTER,
+            )
+        } else {
+            Tween::at(to, now)
+        };
+    }
+
+    /// Tracks the mouse entering / leaving the window as a whole; redraws the chrome when the
+    /// title-on-hover rule or a fully transparent plate changes what is shown.
+    pub(super) fn set_mouse_inside(&mut self, inside: bool) {
+        if self.mouse_inside == inside {
+            return;
+        }
+        self.mouse_inside = inside;
+        // A locked fence shows its lock glyph while the pointer is over it.
+        if self.title_on_hover() || self.is_clear() || self.locked {
+            let _ = self.redraw_chrome_only();
+        }
+        if self.behavior.hide_inactive_scrollbar.get() {
+            if inside {
+                self.sync_scrollbar_alpha();
+            } else {
+                // Leaving counts as activity: the indicator fades 2 s later (WinUI
+                // ScrollView no-indicator countdown), not the instant the pointer is gone.
+                self.note_scroll_activity();
+            }
+        }
+    }
+
+    /// Marquee rectangle in content-local DIPs (visual coordinates, already scrolled).
+    pub(super) fn marquee_rect_dip(&self) -> Option<Rect> {
+        let m = self.marquee.as_ref()?;
+        let scale = self.scale();
+        let title_h = self.content_y as f32;
+        let (cw, _) = self.content_size_px();
+        let fixed = self.layout(cw as f32 / scale).fixed_top();
+        let left = self.content_x as f32;
+        let to_dip = |(x, y): (i32, i32)| {
+            (
+                (x as f32 - left) / scale,
+                (y as f32 - title_h) / scale - fixed,
+            )
+        };
+        let (x0, y0) = to_dip(m.start);
+        // The start corner is anchored to the content, so scrolling under the band keeps it on
+        // the same items.
+        let y0 = y0 + m.start_scroll - self.scroll_y;
+        let (x1, y1) = to_dip(m.cur);
+        Some(Rect {
+            left: x0.min(x1),
+            top: y0.min(y1),
+            right: x0.max(x1),
+            bottom: y0.max(y1),
+        })
+    }
+
+    /// Selects the items whose cells intersect the marquee: replacing the selection, adding to
+    /// it (Shift) or toggling the banded items (Ctrl), like Explorer.
+    pub(super) fn update_marquee_selection(&mut self) {
+        let Some(r) = self.marquee_rect_dip() else {
+            return;
+        };
+        let (grid, view_h) = self.scroll_extent();
+        // Items under the whole rows (「调整大小时按整行整列对齐」) are hidden: not banded.
+        let r = Rect {
+            bottom: r.bottom.min(view_h),
+            ..r
+        };
+        let scroll = self.scroll_y;
+        let (base, mode) = match self.marquee.as_ref() {
+            Some(m) => (m.base.clone(), m.mode),
+            None => return,
+        };
+        let mut band = HashSet::new();
+        for i in 0..self.items.len() {
+            let c = grid.cell(i);
+            let (cy0, cy1) = (c.y - scroll, c.y - scroll + c.h);
+            if c.x < r.right && c.x + c.w > r.left && cy0 < r.bottom && cy1 > r.top {
+                band.insert(i);
+            }
+        }
+        self.selected = match mode {
+            MarqueeMode::Replace => band,
+            MarqueeMode::Add => base.union(&band).copied().collect(),
+            MarqueeMode::Toggle => base.symmetric_difference(&band).copied().collect(),
+        };
+    }
+
+    /// Item area (client px) for the marquee auto-scroll test: (top, bottom).
+    pub(super) fn marquee_band_px(&self) -> (i32, i32) {
+        let scale = self.scale();
+        let (cw, ch) = self.content_size_px();
+        let fixed = self.layout(cw as f32 / scale).fixed_top();
+        let top = self.content_y + (fixed * scale) as i32;
+        (top, self.content_y + ch)
+    }
+
+    /// Updates the item / title-row hover; returns `(item_changed, title_changed)` so the
+    /// caller redraws only the surface that shows the change.
+    pub(super) fn set_hover(&mut self, hover: Option<usize>, title_hover: bool) -> (bool, bool) {
+        if self.retired {
+            // Fading out for good: no hover fades (they would only request frames nobody ticks).
+            return (false, false);
+        }
+        let item = self.hover != hover;
+        let title = self.title_hover != title_hover;
+        self.hover = hover;
+        self.title_hover = title_hover;
+        (item, title)
+    }
+
+    pub(super) fn selected_ids(&self) -> Vec<ItemId> {
+        let mut v: Vec<usize> = self.selected.iter().copied().collect();
+        v.sort_unstable();
+        v.into_iter()
+            .filter_map(|i| self.items.get(i).map(|it| it.id))
+            .collect()
+    }
+}

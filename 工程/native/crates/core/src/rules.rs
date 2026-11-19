@@ -1,0 +1,1233 @@
+//! Auto-sorting rule engine (plan §8). Pure functions over `ItemFacts`.
+
+use crate::model::{FenceId, Origin, RuleId};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum Target {
+    Inbox,
+    Fence(FenceId),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct RuleSet {
+    pub default_target: Target,
+    pub keep_updated: bool,
+    /// Where applying the rules puts an item already in a fence that no rule matches.
+    #[serde(default)]
+    pub unmatched: Unmatched,
+    /// Ordered; the first matching rule wins (after class ordering).
+    pub list: Vec<Rule>,
+}
+
+impl Default for RuleSet {
+    fn default() -> Self {
+        Self {
+            default_target: Target::Inbox,
+            keep_updated: true,
+            unmatched: Unmatched::DefaultTarget,
+            list: Vec::new(),
+        }
+    }
+}
+
+/// What applying the rules does with an item no rule matches. A new item, in no fence yet,
+/// always goes to the default target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum Unmatched {
+    /// Back to the default target (the 「桌面」 fence).
+    #[default]
+    DefaultTarget,
+    /// It stays in the fence it is in.
+    Stay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum Class {
+    /// Shortcut-target rules always evaluate first (Stardock 4.07 behaviour).
+    Target,
+    Type,
+    Name,
+    Time,
+    Custom,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct Rule {
+    pub id: RuleId,
+    pub name: String,
+    pub enabled: bool,
+    pub target: Target,
+    /// All conditions must hold (AND).
+    pub all_of: Vec<Cond>,
+    pub priority_class: Class,
+    /// The "快速添加" template this rule came from (see [`Template::key`]), so the template
+    /// is offered once even after the user renames the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+impl Rule {
+    pub fn new(name: &str, target: Target, all_of: Vec<Cond>) -> Self {
+        let priority_class = if all_of
+            .iter()
+            .any(|c| matches!(c, Cond::ShortcutTarget { .. }))
+        {
+            Class::Target
+        } else if all_of
+            .iter()
+            .any(|c| matches!(c, Cond::Type(_) | Cond::Ext(_)))
+        {
+            Class::Type
+        } else if all_of
+            .iter()
+            .any(|c| matches!(c, Cond::Name { .. } | Cond::Glob(_) | Cond::ExactName(_)))
+        {
+            Class::Name
+        } else if all_of.iter().any(|c| {
+            matches!(
+                c,
+                Cond::CreatedTime { .. } | Cond::CreatedWeekday(_) | Cond::IdleDays { .. }
+            )
+        }) {
+            Class::Time
+        } else {
+            Class::Custom
+        };
+        Self {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            enabled: true,
+            target,
+            all_of,
+            priority_class,
+            template: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum TypeCategory {
+    Programs,
+    Folders,
+    Documents,
+    Images,
+    Music,
+    Video,
+    Archives,
+    Shortcuts,
+    /// Setup packages: `.msi`/`.msix`/`.appx` families and `.exe` files whose name says
+    /// setup/install. Listed after `Programs` in the enum but matched first when a rule using
+    /// it precedes the Programs rule (first match wins).
+    Installers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum StrOp {
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    Is,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", tag = "cond", content = "value")]
+pub enum Cond {
+    Type(Vec<TypeCategory>),
+    Ext(Vec<String>),
+    ExactName(Vec<String>),
+    Name {
+        op: StrOp,
+        value: String,
+    },
+    Glob(String),
+    ShortcutTarget {
+        op: StrOp,
+        value: String,
+    },
+    FoldersOnly,
+    FilesOnly,
+    /// A file that is not a program, a shortcut or a shell namespace item (This PC, Recycle
+    /// Bin): last in the list, it takes every file the earlier rules left. `config.json` saves
+    /// it as `{"cond":"filesOnly","plain":true}`, which versions without it read as `filesOnly`.
+    PlainFiles,
+    SizeMb {
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+    /// Minutes since midnight, local time; wraps past midnight when `from > to`.
+    CreatedTime {
+        from_min: u16,
+        to_min: u16,
+    },
+    /// 0 = Monday … 6 = Sunday.
+    CreatedWeekday(Vec<u8>),
+    Origin(Origin),
+    /// Days since the item was last written or last opened from a fence, whichever is later,
+    /// is at least `min`. Never matches when the age is unknown.
+    IdleDays {
+        min: u32,
+    },
+}
+
+/// Everything the engine may look at for one item.
+#[derive(Clone, Debug, Default)]
+pub struct ItemFacts {
+    /// File name including extension (`Report.docx`, `Steam.lnk`).
+    pub file_name: String,
+    pub is_folder: bool,
+    pub size_bytes: u64,
+    /// Resolved shortcut target path / URL, if the item is a shortcut.
+    pub shortcut_target: Option<String>,
+    /// Extension of the shortcut target (e.g. `.exe`), lower-case with dot.
+    pub shortcut_target_ext: Option<String>,
+    pub created_minutes_local: Option<u16>,
+    pub created_weekday: Option<u8>,
+    pub origin: Origin,
+    pub is_hidden: bool,
+    pub is_system: bool,
+    /// Whole days since the later of last write and last open; `None` when unknown.
+    pub idle_days: Option<u32>,
+    /// Seconds since the later of creation and last write; `None` when unknown.
+    pub age_secs: Option<u64>,
+}
+
+/// Extensions that are never routed (downloads in flight).
+pub const TEMPORARY_EXTS: &[&str] = &[
+    ".crdownload",
+    ".part",
+    ".partial",
+    ".download",
+    ".!ut",
+    ".opdownload",
+];
+
+/// An extension as rules compare it: lower case, no leading dot (`.PDF` → `pdf`).
+fn bare_ext(ext: &str) -> String {
+    ext.trim().trim_start_matches('.').to_lowercase()
+}
+
+pub fn ext_of(file_name: &str) -> String {
+    match file_name.rfind('.') {
+        Some(i) if i > 0 => file_name[i..].to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// [`ItemFacts::shortcut_target_ext`] of a target path: the extension of the target's own name,
+/// so a dot in a folder above it (`C:\Users\jane.doe\Notes`) is no extension.
+pub fn target_ext(target: &str) -> String {
+    ext_of(target.rsplit(['\\', '/']).next().unwrap_or(target))
+}
+
+/// How long a `.tmp` file must have lasted before the rules route it: an Office "safe save"
+/// writes one and renames it over the document in the same moment.
+pub const TMP_SETTLE_SECS: u64 = 60;
+
+/// Is this a temporary/in-flight file that rules must skip? Office lock files and downloads in
+/// flight always; a `.tmp` until it has lasted [`TMP_SETTLE_SECS`] (`age_secs` unknown: not yet).
+pub fn is_temporary(file_name: &str, age_secs: Option<u64>) -> bool {
+    let lower = file_name.to_lowercase();
+    lower.starts_with("~$")
+        || TEMPORARY_EXTS.iter().any(|e| lower.ends_with(e))
+        || (lower.ends_with(".tmp") && !age_secs.is_some_and(|s| s >= TMP_SETTLE_SECS))
+}
+
+/// The categories in the order [`classify`] reports them. A `.lnk` to a program counts as a
+/// program (as the rules do); a plain `setup.exe` is a program before it is an installer.
+pub const CLASSIFY_ORDER: &[TypeCategory] = &[
+    TypeCategory::Folders,
+    TypeCategory::Programs,
+    TypeCategory::Installers,
+    TypeCategory::Shortcuts,
+    TypeCategory::Documents,
+    TypeCategory::Images,
+    TypeCategory::Music,
+    TypeCategory::Video,
+    TypeCategory::Archives,
+];
+
+/// The first category of [`CLASSIFY_ORDER`] the item falls in, using exactly the tests the
+/// `type` rule condition uses; `None` for anything the rules have no name for.
+pub fn classify(facts: &ItemFacts) -> Option<TypeCategory> {
+    CLASSIFY_ORDER
+        .iter()
+        .copied()
+        .find(|cat| category_matches(*cat, facts))
+}
+
+/// The camelCase wire name of a category (`programs`, `folders`, …), as the `type` condition
+/// spells it in JSON.
+pub fn category_name(cat: TypeCategory) -> &'static str {
+    match cat {
+        TypeCategory::Programs => "programs",
+        TypeCategory::Folders => "folders",
+        TypeCategory::Documents => "documents",
+        TypeCategory::Images => "images",
+        TypeCategory::Music => "music",
+        TypeCategory::Video => "video",
+        TypeCategory::Archives => "archives",
+        TypeCategory::Shortcuts => "shortcuts",
+        TypeCategory::Installers => "installers",
+    }
+}
+
+/// The extensions (lower case, with the dot) that make a file a document, image, music, video
+/// or archive; empty for the categories that look at more than the extension.
+pub fn category_exts(cat: TypeCategory) -> &'static [&'static str] {
+    match cat {
+        TypeCategory::Documents => &[
+            ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".txt", ".md", ".rtf",
+            ".odt", ".ods", ".odp", ".csv", ".tsv", ".one", ".epub", ".json", ".xml",
+        ],
+        TypeCategory::Images => &[
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".heic", ".svg", ".tif", ".tiff",
+            ".ico", ".psd", ".raw", ".avif",
+        ],
+        TypeCategory::Music => &[
+            ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".opus",
+        ],
+        TypeCategory::Video => &[
+            ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v", ".ts",
+        ],
+        TypeCategory::Archives => &[
+            ".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".iso", ".cab",
+        ],
+        TypeCategory::Programs
+        | TypeCategory::Folders
+        | TypeCategory::Shortcuts
+        | TypeCategory::Installers => &[],
+    }
+}
+
+/// Whether a file `file_name` (a folder when `is_folder`) is in `cat`, by the tests the `type`
+/// rule condition uses: a shortcut by its `shortcut_target` (one whose target is unknown counts
+/// as a program, as there).
+pub fn file_in_category(
+    cat: TypeCategory,
+    file_name: &str,
+    is_folder: bool,
+    shortcut_target: Option<&str>,
+) -> bool {
+    let facts = ItemFacts {
+        file_name: file_name.to_string(),
+        is_folder,
+        shortcut_target: shortcut_target.map(str::to_string),
+        shortcut_target_ext: shortcut_target.map(target_ext),
+        ..ItemFacts::default()
+    };
+    category_matches(cat, &facts)
+}
+
+fn category_matches(cat: TypeCategory, facts: &ItemFacts) -> bool {
+    let ext = ext_of(&facts.file_name);
+    let target_ext = facts.shortcut_target_ext.as_deref().unwrap_or("");
+    match cat {
+        TypeCategory::Folders => facts.is_folder,
+        // A shortcut is a program when its target is one, or when it has no target path to
+        // read (a Store app, an advertised Office shortcut). One to a folder is a shortcut.
+        TypeCategory::Programs => {
+            !facts.is_folder
+                && (matches!(
+                    ext.as_str(),
+                    ".exe" | ".msi" | ".bat" | ".cmd" | ".appref-ms"
+                ) || (ext == ".lnk"
+                    && (matches!(target_ext, ".exe" | ".msi" | ".bat" | ".cmd")
+                        || (target_ext.is_empty() && facts.shortcut_target.is_none()))))
+        }
+        TypeCategory::Shortcuts => {
+            !facts.is_folder && matches!(ext.as_str(), ".lnk" | ".url" | ".website")
+        }
+        TypeCategory::Documents
+        | TypeCategory::Images
+        | TypeCategory::Music
+        | TypeCategory::Video
+        | TypeCategory::Archives => !facts.is_folder && category_exts(cat).contains(&ext.as_str()),
+        TypeCategory::Installers => {
+            if facts.is_folder {
+                return false;
+            }
+            match ext.as_str() {
+                ".msi" | ".msix" | ".msixbundle" | ".appx" | ".appxbundle" | ".appinstaller" => {
+                    true
+                }
+                ".exe" => {
+                    let name = facts.file_name.to_lowercase();
+                    name.contains("setup") || name.contains("install")
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+fn str_op(op: StrOp, haystack: &str, needle: &str) -> bool {
+    let h = haystack.to_lowercase();
+    let n = needle.to_lowercase();
+    match op {
+        StrOp::Contains => h.contains(&n),
+        StrOp::NotContains => !h.contains(&n),
+        StrOp::StartsWith => h.starts_with(&n),
+        StrOp::EndsWith => h.ends_with(&n),
+        StrOp::Is => h == n,
+    }
+}
+
+/// Minimal glob: `*` and `?`, case-insensitive.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    fn rec(p: &[char], t: &[char]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some('*'), _) => rec(&p[1..], t) || (!t.is_empty() && rec(p, &t[1..])),
+            (Some('?'), Some(_)) => rec(&p[1..], &t[1..]),
+            (Some(a), Some(b))
+                if a.eq_ignore_ascii_case(b) || a.to_lowercase().eq(b.to_lowercase()) =>
+            {
+                rec(&p[1..], &t[1..])
+            }
+            _ => false,
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    rec(&p, &t)
+}
+
+pub fn cond_matches(cond: &Cond, facts: &ItemFacts) -> bool {
+    match cond {
+        Cond::Type(cats) => cats.iter().any(|c| category_matches(*c, facts)),
+        Cond::Ext(exts) => {
+            // A suffix match, so `tar.gz` and dot files such as `.gitignore` match too.
+            let name = facts.file_name.to_lowercase();
+            exts.iter().any(|e| {
+                let e = e.to_lowercase();
+                let e = if e.starts_with('.') {
+                    e
+                } else {
+                    format!(".{e}")
+                };
+                name.ends_with(&e)
+            })
+        }
+        Cond::ExactName(names) => names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&facts.file_name)),
+        Cond::Name { op, value } => str_op(*op, &facts.file_name, value),
+        Cond::Glob(g) => glob_match(g, &facts.file_name),
+        Cond::ShortcutTarget { op, value } => facts
+            .shortcut_target
+            .as_deref()
+            .map(|t| str_op(*op, t, value))
+            .unwrap_or(false),
+        Cond::FoldersOnly => facts.is_folder,
+        Cond::FilesOnly => !facts.is_folder,
+        Cond::PlainFiles => {
+            !facts.is_folder
+                && facts.origin != Origin::Namespace
+                && !category_matches(TypeCategory::Programs, facts)
+                && !category_matches(TypeCategory::Shortcuts, facts)
+        }
+        Cond::SizeMb { min, max } => {
+            let mb = facts.size_bytes as f64 / (1024.0 * 1024.0);
+            min.is_none_or(|m| mb >= m) && max.is_none_or(|m| mb <= m)
+        }
+        Cond::CreatedTime { from_min, to_min } => match facts.created_minutes_local {
+            Some(m) => {
+                if from_min <= to_min {
+                    m >= *from_min && m <= *to_min
+                } else {
+                    m >= *from_min || m <= *to_min
+                }
+            }
+            None => false,
+        },
+        Cond::CreatedWeekday(days) => facts
+            .created_weekday
+            .map(|d| days.contains(&d))
+            .unwrap_or(false),
+        Cond::Origin(o) => facts.origin == *o,
+        Cond::IdleDays { min } => facts.idle_days.is_some_and(|d| d >= *min),
+    }
+}
+
+/// Outcome of evaluating the rule set for one item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Temporary/system item: leave it alone for now.
+    Skip,
+    /// Matched `rule`, go to its target.
+    Route { target: Target, rule: RuleId },
+    /// No rule matched: default target.
+    Default(Target),
+}
+
+impl RuleSet {
+    pub fn evaluate(&self, facts: &ItemFacts) -> Decision {
+        if is_temporary(&facts.file_name, facts.age_secs)
+            || facts.is_system
+            || facts.file_name.eq_ignore_ascii_case("desktop.ini")
+        {
+            return Decision::Skip;
+        }
+        let mut ordered: Vec<&Rule> = self.list.iter().filter(|r| r.enabled).collect();
+        // Stable sort: Target-class first, everything else keeps user order.
+        ordered.sort_by_key(|r| {
+            if r.priority_class == Class::Target {
+                0
+            } else {
+                1
+            }
+        });
+        for rule in ordered {
+            if !rule.all_of.is_empty() && rule.all_of.iter().all(|c| cond_matches(c, facts)) {
+                return Decision::Route {
+                    target: rule.target,
+                    rule: rule.id,
+                };
+            }
+        }
+        Decision::Default(self.default_target)
+    }
+
+    /// The first enabled rule whose only condition is a list of extensions naming `ext`
+    /// (`pdf` or `.pdf`, any case): the rule the item menu's 「以后把 .pdf 文件都放到这里」
+    /// reports and changes.
+    pub fn extension_rule(&self, ext: &str) -> Option<usize> {
+        let want = bare_ext(ext);
+        self.list.iter().position(|r| {
+            r.enabled
+                && matches!(&r.all_of[..], [Cond::Ext(exts)] if exts.iter().any(|e| bare_ext(e) == want))
+        })
+    }
+
+    /// 「以后把 .pdf 文件都放到这里」: files ending in `ext` go to `target` from now on. The
+    /// rule goes first in the list, so a type rule further up (文件与文档) does not take them.
+    /// The rule [`Self::extension_rule`] finds moves to the front with the new target when
+    /// `ext` is all it lists; otherwise `ext` leaves it and a new rule named `name` goes first.
+    /// Returns the id of the rule that now routes `ext`.
+    pub fn put_extension_first(&mut self, ext: &str, target: Target, name: &str) -> RuleId {
+        let want = bare_ext(ext);
+        if let Some(i) = self.extension_rule(ext) {
+            let Cond::Ext(exts) = &mut self.list[i].all_of[0] else {
+                unreachable!("extension_rule found an extension rule");
+            };
+            if exts.iter().all(|e| bare_ext(e) == want) {
+                let mut rule = self.list.remove(i);
+                rule.target = target;
+                let id = rule.id;
+                self.list.insert(0, rule);
+                return id;
+            }
+            exts.retain(|e| bare_ext(e) != want);
+        }
+        let rule = Rule::new(name, target, vec![Cond::Ext(vec![want])]);
+        let id = rule.id;
+        self.list.insert(0, rule);
+        id
+    }
+
+    /// Whether any enabled rule depends on the clock (idle days), so it must be re-run
+    /// periodically rather than only when the desktop changes.
+    pub fn has_idle_rules(&self) -> bool {
+        self.list
+            .iter()
+            .any(|r| r.enabled && r.all_of.iter().any(|c| matches!(c, Cond::IdleDays { .. })))
+    }
+
+    /// Stardock-style first-run presets: 程序 / 文件夹 / 文件与文档 (+ 下载 by name).
+    pub fn default_presets(programs: FenceId, folders: FenceId, documents: FenceId) -> Self {
+        Self {
+            default_target: Target::Inbox,
+            keep_updated: true,
+            unmatched: Unmatched::DefaultTarget,
+            list: vec![
+                Rule::new(
+                    crate::i18n::text("程序与快捷方式"),
+                    Target::Fence(programs),
+                    vec![Cond::Type(vec![
+                        TypeCategory::Programs,
+                        TypeCategory::Shortcuts,
+                    ])],
+                ),
+                Rule::new(
+                    crate::i18n::text("文件夹"),
+                    Target::Fence(folders),
+                    vec![Cond::Type(vec![TypeCategory::Folders])],
+                ),
+                Rule::new(
+                    crate::i18n::text("文件与文档"),
+                    Target::Fence(documents),
+                    vec![Cond::Type(vec![
+                        TypeCategory::Documents,
+                        TypeCategory::Images,
+                        TypeCategory::Music,
+                        TypeCategory::Video,
+                        TypeCategory::Archives,
+                    ])],
+                ),
+            ],
+        }
+    }
+}
+
+/// How `config.json` stores the rules (`#[serde(with)]` on `Config::rules`): a 「普通文件」
+/// condition is written as `{"cond":"filesOnly","plain":true}`. Versions without it (0.2.1 and
+/// older) read that as 「仅文件」; an unknown `"cond"` would make them refuse the whole file.
+pub mod saved {
+    use super::RuleSet;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::{Value, json};
+
+    fn conds(rules: &mut Value) -> impl Iterator<Item = &mut Value> {
+        rules
+            .get_mut("list")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rule.get_mut("allOf").and_then(Value::as_array_mut))
+            .flatten()
+    }
+
+    pub fn serialize<S: Serializer>(rules: &RuleSet, s: S) -> Result<S::Ok, S::Error> {
+        let mut v = serde_json::to_value(rules).map_err(serde::ser::Error::custom)?;
+        for c in conds(&mut v).filter(|c| c["cond"] == "plainFiles") {
+            *c = json!({ "cond": "filesOnly", "plain": true });
+        }
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<RuleSet, D::Error> {
+        let mut v = Value::deserialize(d)?;
+        for c in conds(&mut v).filter(|c| c["cond"] == "filesOnly" && c["plain"] == true) {
+            *c = json!({ "cond": "plainFiles" });
+        }
+        RuleSet::deserialize(v).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Idle threshold of the "待清理" template: installers and archives untouched this long are
+/// gathered (never deleted) so the user can decide about them.
+pub const CLEANUP_IDLE_DAYS: u32 = 30;
+
+/// "快速添加" presets: one click creates a fence and the rule that fills it. Titles are
+/// localized when the template is applied and stored as plain data, like the first-run fences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Template {
+    Images,
+    Music,
+    Video,
+    Archives,
+    Installers,
+    /// Installers and archives idle for [`CLEANUP_IDLE_DAYS`]: gathered, not deleted.
+    Cleanup,
+    /// Steam, Epic and Xbox game shortcuts (feedback #83), apart from the other programs.
+    Games,
+}
+
+/// Where a game shortcut points, by store: text its target contains. Steam and Epic put `.url`
+/// shortcuts on the desktop that start the game through their launcher, and a `.lnk` to a
+/// game's program lies in the store's game folder.
+pub const GAME_SHORTCUT_TARGETS: [(&str, &str); 5] = [
+    ("Steam", "steam://rungameid/"),
+    ("Steam", "\\steamapps\\common\\"),
+    ("Epic", "com.epicgames.launcher://apps/"),
+    ("Epic", "\\Epic Games\\"),
+    ("Xbox", "\\XboxGames\\"),
+];
+
+impl Template {
+    pub const ALL: [Template; 7] = [
+        Template::Images,
+        Template::Music,
+        Template::Video,
+        Template::Archives,
+        Template::Installers,
+        Template::Cleanup,
+        Template::Games,
+    ];
+
+    /// Stable identifier used by the settings page and stored in [`Rule::template`].
+    pub fn key(self) -> &'static str {
+        match self {
+            Template::Images => "images",
+            Template::Music => "music",
+            Template::Video => "video",
+            Template::Archives => "archives",
+            Template::Installers => "installers",
+            Template::Cleanup => "cleanup",
+            Template::Games => "games",
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.key() == key)
+    }
+
+    /// Fence title and rule name in the current UI language.
+    pub fn title(self) -> String {
+        crate::i18n::text(match self {
+            Template::Images => "图片",
+            Template::Music => "音乐",
+            Template::Video => "视频",
+            Template::Archives => "压缩包",
+            Template::Installers => "安装包",
+            Template::Cleanup => "待清理",
+            Template::Games => "游戏",
+        })
+        .to_string()
+    }
+
+    /// The rules that fill `fence`, tagged with this template's key: one rule, or for 游戏 one
+    /// per kind of game shortcut, as all conditions of a rule must hold. Those are plain
+    /// 「快捷方式目标包含」 rules, which the settings page shows and edits like any other.
+    pub fn rules(self, fence: FenceId) -> Vec<Rule> {
+        let one = |conds| vec![self.tagged(&self.title(), fence, conds)];
+        match self {
+            Template::Images => one(vec![Cond::Type(vec![TypeCategory::Images])]),
+            Template::Music => one(vec![Cond::Type(vec![TypeCategory::Music])]),
+            Template::Video => one(vec![Cond::Type(vec![TypeCategory::Video])]),
+            Template::Archives => one(vec![Cond::Type(vec![TypeCategory::Archives])]),
+            Template::Installers => one(vec![Cond::Type(vec![TypeCategory::Installers])]),
+            Template::Cleanup => one(vec![
+                Cond::Type(vec![TypeCategory::Installers, TypeCategory::Archives]),
+                Cond::IdleDays {
+                    min: CLEANUP_IDLE_DAYS,
+                },
+            ]),
+            Template::Games => GAME_SHORTCUT_TARGETS
+                .iter()
+                .map(|&(store, target)| {
+                    let name = match store {
+                        "Steam" => crate::i18n::text("Steam 游戏"),
+                        "Epic" => crate::i18n::text("Epic 游戏"),
+                        _ => crate::i18n::text("Xbox 游戏"),
+                    };
+                    let cond = Cond::ShortcutTarget {
+                        op: StrOp::Contains,
+                        value: target.to_string(),
+                    };
+                    self.tagged(name, fence, vec![cond])
+                })
+                .collect(),
+        }
+    }
+
+    fn tagged(self, name: &str, fence: FenceId, conds: Vec<Cond>) -> Rule {
+        let mut rule = Rule::new(name, Target::Fence(fence), conds);
+        rule.template = Some(self.key().to_string());
+        rule
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(name: &str) -> ItemFacts {
+        ItemFacts {
+            file_name: name.into(),
+            origin: Origin::UserDesktop,
+            ..Default::default()
+        }
+    }
+
+    fn routed(rs: &RuleSet, name: &str) -> Option<Target> {
+        match rs.evaluate(&facts(name)) {
+            Decision::Route { target, .. } => Some(target),
+            _ => None,
+        }
+    }
+
+    /// 「以后把 .pdf 文件都放到这里」 wins over the first-run type rule, moves an extension
+    /// rule of its own to the front, and takes the extension out of a shared one.
+    #[test]
+    fn put_extension_first_routes_the_extension_to_the_target() {
+        let (programs, folders, docs, work, other) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut rs = RuleSet::default_presets(programs, folders, docs);
+        assert_eq!(routed(&rs, "Invoice.pdf"), Some(Target::Fence(docs)));
+        assert_eq!(rs.extension_rule(".pdf"), None);
+        let id = rs.put_extension_first(".PDF", Target::Fence(work), ".pdf 文件");
+        assert_eq!(rs.list[0].id, id);
+        assert_eq!(rs.list.len(), 4);
+        assert_eq!(routed(&rs, "Invoice.pdf"), Some(Target::Fence(work)));
+        assert_eq!(routed(&rs, "Notes.docx"), Some(Target::Fence(docs)));
+        assert_eq!(rs.extension_rule("pdf"), Some(0));
+        // Again for another fence: the same rule changes its target (no second rule).
+        rs.list.swap(0, 3);
+        let again = rs.put_extension_first("pdf", Target::Fence(other), "x");
+        assert_eq!((again, rs.list[0].id, rs.list.len()), (id, id, 4));
+        assert_eq!(routed(&rs, "Invoice.pdf"), Some(Target::Fence(other)));
+        // A rule listing several extensions keeps the others.
+        rs.list.insert(
+            0,
+            Rule::new(
+                "office",
+                Target::Fence(docs),
+                vec![Cond::Ext(vec!["docx".into(), "xlsx".into()])],
+            ),
+        );
+        rs.put_extension_first(".xlsx", Target::Inbox, ".xlsx 文件");
+        assert_eq!(routed(&rs, "Budget.xlsx"), Some(Target::Inbox));
+        assert_eq!(routed(&rs, "Notes.docx"), Some(Target::Fence(docs)));
+        assert_eq!(rs.list.len(), 6);
+        // A disabled rule is not the extension's rule.
+        rs.list[0].enabled = false;
+        assert_eq!(rs.extension_rule("xlsx"), None);
+    }
+
+    #[test]
+    fn classify_names_the_first_matching_category() {
+        let kind = |name: &str| classify(&facts(name)).map(category_name);
+        assert_eq!(kind("report.PDF"), Some("documents"));
+        assert_eq!(kind("table.tsv"), Some("documents"));
+        assert_eq!(kind("photo.jpeg"), Some("images"));
+        assert_eq!(kind("song.mp3"), Some("music"));
+        assert_eq!(kind("clip.mkv"), Some("video"));
+        assert_eq!(kind("bundle.7z"), Some("archives"));
+        assert_eq!(kind("tool.exe"), Some("programs"));
+        // setup.exe is a program first, an installer second; .msi is a program too.
+        assert_eq!(kind("setup.exe"), Some("programs"));
+        assert_eq!(kind("thing.msix"), Some("installers"));
+        assert_eq!(kind("page.url"), Some("shortcuts"));
+        assert_eq!(kind("readme"), None);
+        assert_eq!(kind("data.xyz"), None);
+        let mut folder = facts("Projects");
+        folder.is_folder = true;
+        assert_eq!(classify(&folder).map(category_name), Some("folders"));
+        // A .lnk to a program is a program; to a document, a shortcut.
+        let mut lnk = facts("Steam.lnk");
+        lnk.shortcut_target_ext = Some(".exe".into());
+        assert_eq!(classify(&lnk).map(category_name), Some("programs"));
+        lnk.shortcut_target_ext = Some(".docx".into());
+        assert_eq!(classify(&lnk).map(category_name), Some("shortcuts"));
+        // Feedback #125: one to a folder is a shortcut (with or without a dot in a name on the
+        // way); one whose target cannot be read (a Store app) is a program.
+        for target in [
+            r"D:\Projects",
+            r"C:\Users\jane.doe\Notes",
+            r"D:\Builds\v1.2",
+        ] {
+            lnk.shortcut_target = Some(target.into());
+            lnk.shortcut_target_ext = Some(target_ext(target));
+            assert_eq!(
+                classify(&lnk).map(category_name),
+                Some("shortcuts"),
+                "{target}"
+            );
+        }
+        lnk.shortcut_target = Some(r"C:\Users\jane.doe\Tools\run.CMD".into());
+        lnk.shortcut_target_ext = Some(target_ext(r"C:\Users\jane.doe\Tools\run.CMD"));
+        assert_eq!(classify(&lnk).map(category_name), Some("programs"));
+        lnk.shortcut_target = None;
+        lnk.shortcut_target_ext = None;
+        assert_eq!(classify(&lnk).map(category_name), Some("programs"));
+        assert_eq!(target_ext(r"C:\Users\jane.doe\Notes"), "");
+        assert_eq!(target_ext("%ProgramFiles%/App/App.EXE"), ".exe");
+        // Every category has a name and the names are the serde spellings.
+        for cat in CLASSIFY_ORDER {
+            let json = serde_json::to_value(cat).unwrap();
+            assert_eq!(json.as_str().unwrap(), category_name(*cat));
+        }
+        assert_eq!(CLASSIFY_ORDER.len(), 9);
+    }
+
+    #[test]
+    fn temp_files_are_skipped() {
+        let rs = RuleSet::default();
+        assert_eq!(rs.evaluate(&facts("setup.exe.crdownload")), Decision::Skip);
+        assert_eq!(rs.evaluate(&facts("~$report.docx")), Decision::Skip);
+        assert_eq!(rs.evaluate(&facts("desktop.ini")), Decision::Skip);
+    }
+
+    /// A `.bak` is a file like any other; a `.tmp` too once it has lasted a while (Word's
+    /// `~WRD0000.tmp` is renamed over the document in the same moment).
+    #[test]
+    fn tmp_files_are_skipped_only_while_fresh_and_bak_files_are_routed() {
+        let rs = RuleSet::default();
+        assert_eq!(
+            rs.evaluate(&facts("notes.bak")),
+            Decision::Default(Target::Inbox)
+        );
+        let mut tmp = facts("~WRD0000.tmp");
+        assert_eq!(rs.evaluate(&tmp), Decision::Skip);
+        tmp.age_secs = Some(TMP_SETTLE_SECS - 1);
+        assert_eq!(rs.evaluate(&tmp), Decision::Skip);
+        tmp.age_secs = Some(TMP_SETTLE_SECS);
+        assert_eq!(rs.evaluate(&tmp), Decision::Default(Target::Inbox));
+        // Age makes no difference to the other temporary names.
+        let mut lock = facts("~$report.docx");
+        lock.age_secs = Some(3600);
+        assert_eq!(rs.evaluate(&lock), Decision::Skip);
+        assert!(is_temporary("Report.TMP", None));
+        assert!(!is_temporary("Report.TMP", Some(TMP_SETTLE_SECS)));
+    }
+
+    #[test]
+    fn presets_route_by_type_and_default_to_inbox() {
+        let (p, f, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let rs = RuleSet::default_presets(p, f, d);
+        assert!(
+            matches!(rs.evaluate(&facts("Steam.lnk")), Decision::Route { target: Target::Fence(t), .. } if t == p)
+        );
+        let mut folder = facts("Projects");
+        folder.is_folder = true;
+        assert!(
+            matches!(rs.evaluate(&folder), Decision::Route { target: Target::Fence(t), .. } if t == f)
+        );
+        assert!(
+            matches!(rs.evaluate(&facts("photo.JPG")), Decision::Route { target: Target::Fence(t), .. } if t == d)
+        );
+        assert_eq!(
+            rs.evaluate(&facts("weird.xyz")),
+            Decision::Default(Target::Inbox)
+        );
+    }
+
+    #[test]
+    fn plain_files_leave_out_folders_programs_shortcuts_and_namespace_items() {
+        let plain = |f: &ItemFacts| cond_matches(&Cond::PlainFiles, f);
+        for name in [
+            "page.html",
+            "query.sql",
+            "data.xml",
+            "notes.txt",
+            "a.zip",
+            "README",
+        ] {
+            assert!(plain(&facts(name)), "{name}");
+        }
+        for name in [
+            "tool.exe",
+            "run.bat",
+            "setup.msi",
+            "app.appref-ms",
+            "site.url",
+        ] {
+            assert!(!plain(&facts(name)), "{name}");
+        }
+        // A .lnk is a shortcut whatever it points to.
+        let mut lnk = facts("Report.lnk");
+        lnk.shortcut_target_ext = Some(".docx".into());
+        assert!(!plain(&lnk));
+        let mut folder = facts("Projects");
+        folder.is_folder = true;
+        assert!(!plain(&folder));
+        let mut bin = facts("Recycle Bin");
+        bin.origin = Origin::Namespace;
+        assert!(!plain(&bin));
+    }
+
+    /// #70 / #71: type rules first, a 「普通文件」 rule last takes the files they leave.
+    #[test]
+    fn a_final_plain_files_rule_takes_what_the_type_rules_leave() {
+        let [archives, folders, docs, images, other] = [(); 5].map(|_| Uuid::new_v4());
+        let type_rule = |cat, to| Rule::new("t", Target::Fence(to), vec![Cond::Type(vec![cat])]);
+        let mut rs = RuleSet {
+            list: vec![
+                type_rule(TypeCategory::Archives, archives),
+                type_rule(TypeCategory::Folders, folders),
+                type_rule(TypeCategory::Documents, docs),
+                type_rule(TypeCategory::Images, images),
+                Rule::new("other", Target::Fence(other), vec![Cond::PlainFiles]),
+            ],
+            ..Default::default()
+        };
+        let to = |rs: &RuleSet, f: &ItemFacts| match rs.evaluate(f) {
+            Decision::Route {
+                target: Target::Fence(id),
+                ..
+            } => Some(id),
+            _ => None,
+        };
+        assert_eq!(to(&rs, &facts("backup.7z")), Some(archives));
+        assert_eq!(to(&rs, &facts("report.docx")), Some(docs));
+        assert_eq!(to(&rs, &facts("table.tsv")), Some(docs));
+        assert_eq!(to(&rs, &facts("photo.png")), Some(images));
+        for n in ["query.sql", "page.html", "data.qwe", "LICENSE"] {
+            assert_eq!(to(&rs, &facts(n)), Some(other), "{n}");
+        }
+        let mut folder = facts("Projects");
+        folder.is_folder = true;
+        assert_eq!(to(&rs, &folder), Some(folders));
+        for n in ["tool.exe", "Steam.lnk", "site.url"] {
+            assert_eq!(
+                rs.evaluate(&facts(n)),
+                Decision::Default(Target::Inbox),
+                "{n}"
+            );
+        }
+        // .xml is a document type: a documents rule by extension list leaves it to 「普通文件」.
+        assert_eq!(to(&rs, &facts("data.xml")), Some(docs));
+        rs.list[2] = Rule::new(
+            "docs",
+            Target::Fence(docs),
+            vec![Cond::Ext(vec!["docx".into(), "pdf".into()])],
+        );
+        assert_eq!(to(&rs, &facts("data.xml")), Some(other));
+    }
+
+    #[test]
+    fn unmatched_defaults_to_the_default_target_and_old_rule_sets_load() {
+        let rs: RuleSet =
+            serde_json::from_str(r#"{"defaultTarget":"inbox","keepUpdated":true,"list":[]}"#)
+                .unwrap();
+        assert_eq!(rs.unmatched, Unmatched::DefaultTarget);
+        let json = serde_json::to_value(RuleSet {
+            unmatched: Unmatched::Stay,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(json["unmatched"], "stay");
+        let cond: Cond = serde_json::from_str(r#"{"cond":"plainFiles","value":null}"#).unwrap();
+        assert_eq!(cond, Cond::PlainFiles);
+    }
+
+    /// A config with a 「普通文件」 rule must still load in 0.2.1, whose `Cond` has no such
+    /// variant: the file spells it `filesOnly` plus a key 0.2.1 ignores.
+    #[test]
+    fn plain_files_are_saved_in_a_form_older_versions_read() {
+        let mut cfg = crate::Config::default();
+        let conds = vec![Cond::FilesOnly, Cond::PlainFiles];
+        cfg.rules
+            .list
+            .push(Rule::new("r", Target::Inbox, conds.clone()));
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("plainFiles"), "{text}");
+        assert!(text.contains(r#"[{"cond":"filesOnly"},{"cond":"filesOnly","plain":true}]"#));
+        let old: Cond = serde_json::from_str(r#"{"cond":"filesOnly","plain":true}"#).unwrap();
+        assert_eq!(old, Cond::FilesOnly);
+        let back: crate::Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.rules.list[0].all_of, conds);
+        // The settings page and the CLI see the rule set itself, with its own name.
+        assert!(
+            serde_json::to_string(&cfg.rules)
+                .unwrap()
+                .contains("plainFiles")
+        );
+    }
+
+    #[test]
+    fn target_class_rules_win_regardless_of_order() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let rs = RuleSet {
+            default_target: Target::Inbox,
+            keep_updated: true,
+            unmatched: Unmatched::DefaultTarget,
+            list: vec![
+                Rule::new(
+                    "all lnk",
+                    Target::Fence(a),
+                    vec![Cond::Ext(vec!["lnk".into()])],
+                ),
+                Rule::new(
+                    "games",
+                    Target::Fence(b),
+                    vec![Cond::ShortcutTarget {
+                        op: StrOp::Contains,
+                        value: "steam".into(),
+                    }],
+                ),
+            ],
+        };
+        let mut f = facts("Dota.lnk");
+        f.shortcut_target = Some("C:\\Program Files\\Steam\\steam.exe".into());
+        assert!(
+            matches!(rs.evaluate(&f), Decision::Route { target: Target::Fence(t), .. } if t == b)
+        );
+    }
+
+    #[test]
+    fn installers_are_setup_packages_and_setup_named_exes() {
+        let is = |name: &str| category_matches(TypeCategory::Installers, &facts(name));
+        assert!(is("vlc-3.0.21-win64.msi"));
+        assert!(is("App.msixbundle"));
+        assert!(is("Steam-Setup.exe"));
+        assert!(is("node-v22-x64-installer.exe"));
+        assert!(!is("notepad.exe"));
+        assert!(!is("setup.txt"));
+        let mut folder = facts("Setup");
+        folder.is_folder = true;
+        assert!(!category_matches(TypeCategory::Installers, &folder));
+    }
+
+    #[test]
+    fn ext_conditions_match_multi_part_extensions_and_dot_files() {
+        let ext = |e: &str, name: &str| cond_matches(&Cond::Ext(vec![e.into()]), &facts(name));
+        assert!(ext("pdf", "Report.PDF"));
+        assert!(ext(".pdf", "report.pdf"));
+        assert!(!ext("pdf", "report.pdf.txt"));
+        assert!(ext("tar.gz", "archive.tar.gz"));
+        assert!(ext("gz", "archive.tar.gz"));
+        assert!(!ext("tar.gz", "archive.gz"));
+        assert!(ext("gitignore", ".gitignore"));
+        assert!(!ext("pdf", "pdf"));
+    }
+
+    #[test]
+    fn idle_days_needs_a_known_age() {
+        let c = Cond::IdleDays { min: 30 };
+        let mut f = facts("old-setup.exe");
+        assert!(!cond_matches(&c, &f), "unknown age never matches");
+        f.idle_days = Some(29);
+        assert!(!cond_matches(&c, &f));
+        f.idle_days = Some(30);
+        assert!(cond_matches(&c, &f));
+    }
+
+    #[test]
+    fn cleanup_template_gathers_only_idle_installers_and_archives() {
+        let fence = Uuid::new_v4();
+        let rule = Template::Cleanup.rules(fence).remove(0);
+        assert_eq!(rule.template.as_deref(), Some("cleanup"));
+        assert_eq!(rule.priority_class, Class::Type);
+        let rs = RuleSet {
+            list: vec![rule],
+            ..Default::default()
+        };
+        let mut old_zip = facts("backup.zip");
+        old_zip.idle_days = Some(45);
+        assert!(
+            matches!(rs.evaluate(&old_zip), Decision::Route { target: Target::Fence(t), .. } if t == fence)
+        );
+        let mut fresh_zip = facts("backup.zip");
+        fresh_zip.idle_days = Some(2);
+        assert_eq!(fresh_zip.file_name, "backup.zip");
+        assert_eq!(rs.evaluate(&fresh_zip), Decision::Default(Target::Inbox));
+        let mut old_doc = facts("thesis.docx");
+        old_doc.idle_days = Some(400);
+        assert_eq!(rs.evaluate(&old_doc), Decision::Default(Target::Inbox));
+        assert!(rs.has_idle_rules());
+        assert!(!RuleSet::default_presets(fence, fence, fence).has_idle_rules());
+        assert_eq!(Template::parse("cleanup"), Some(Template::Cleanup));
+        assert_eq!(Template::parse("nope"), None);
+    }
+
+    /// 游戏 (feedback #83): Steam and Epic `.url` shortcuts and `.lnk` shortcuts into a store's
+    /// game folder go to the games fence, ahead of the first-run 「程序与快捷方式」 rule; the
+    /// launchers and other shortcuts stay where they were.
+    #[test]
+    fn games_template_catches_steam_epic_and_xbox_shortcuts() {
+        let (games, programs, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let rules = Template::Games.rules(games);
+        assert_eq!(rules.len(), 5);
+        assert!(rules.iter().all(|r| r.template.as_deref() == Some("games")
+            && r.priority_class == Class::Target
+            && r.target == Target::Fence(games)));
+        assert_eq!(Template::parse("games"), Some(Template::Games));
+        // The template goes after the first-run presets here: target rules still come first.
+        let mut rs = RuleSet::default_presets(programs, other, other);
+        rs.list.extend(rules);
+        let shortcut = |name: &str, target: &str| {
+            let mut f = facts(name);
+            f.shortcut_target = Some(target.into());
+            f.shortcut_target_ext = Some(if name.ends_with(".url") {
+                ".url".into()
+            } else {
+                ext_of(target)
+            });
+            f
+        };
+        let to = |f: &ItemFacts| match rs.evaluate(f) {
+            Decision::Route { target, .. } => target,
+            Decision::Default(target) => target,
+            Decision::Skip => panic!("skipped {}", f.file_name),
+        };
+        for game in [
+            shortcut("Dota 2.url", "steam://rungameid/570"),
+            shortcut(
+                "Fortnite.url",
+                "com.epicgames.launcher://apps/fn%3A4fe75bbc5a674f4f9b356b5c90567da5%3AFortnite?action=launch&silent=true",
+            ),
+            shortcut(
+                "Hades.lnk",
+                r"D:\SteamLibrary\steamapps\common\Hades\x64\Hades.exe",
+            ),
+            shortcut(
+                "Alan Wake 2.lnk",
+                r"%ProgramFiles%\Epic Games\AlanWake2\AlanWake2.exe",
+            ),
+            shortcut(
+                "Halo Infinite.lnk",
+                r"C:\XboxGames\Halo Infinite\Content\HaloInfinite.exe",
+            ),
+            shortcut("Portal.LNK", r"E:\Games\STEAMAPPS\Common\Portal\hl2.exe"),
+        ] {
+            assert_eq!(to(&game), Target::Fence(games), "{}", game.file_name);
+        }
+        for program in [
+            shortcut("Steam.lnk", r"C:\Program Files (x86)\Steam\steam.exe"),
+            shortcut("Notepad.lnk", r"C:\Windows\notepad.exe"),
+            shortcut("Steam Store.url", "https://store.steampowered.com/app/570"),
+            shortcut("My Games.lnk", r"C:\Users\me\Epic Gamesaves\save.exe"),
+        ] {
+            assert_eq!(
+                to(&program),
+                Target::Fence(programs),
+                "{}",
+                program.file_name
+            );
+        }
+        // A folder named like a game folder is no shortcut.
+        let mut folder = facts("steamapps");
+        folder.is_folder = true;
+        assert_eq!(to(&folder), Target::Fence(other));
+    }
+
+    #[test]
+    fn idle_template_rule_is_recognised_for_ordering() {
+        let f = Uuid::new_v4();
+        let cleanup = Template::Cleanup.rules(f).remove(0);
+        let installers = Template::Installers.rules(f).remove(0);
+        assert!(
+            cleanup
+                .all_of
+                .iter()
+                .any(|c| matches!(c, Cond::IdleDays { .. }))
+        );
+        assert!(
+            !installers
+                .all_of
+                .iter()
+                .any(|c| matches!(c, Cond::IdleDays { .. }))
+        );
+    }
+
+    #[test]
+    fn glob_and_time_conditions() {
+        assert!(glob_match("*.PNG", "shot.png"));
+        assert!(glob_match("report-??.docx", "report-01.docx"));
+        assert!(!glob_match("*.png", "shot.jpg"));
+        let c = Cond::CreatedTime {
+            from_min: 22 * 60,
+            to_min: 6 * 60,
+        };
+        let mut f = facts("x");
+        f.created_minutes_local = Some(23 * 60);
+        assert!(cond_matches(&c, &f));
+        f.created_minutes_local = Some(12 * 60);
+        assert!(!cond_matches(&c, &f));
+    }
+}

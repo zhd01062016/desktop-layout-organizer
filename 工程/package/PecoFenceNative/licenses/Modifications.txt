@@ -1,0 +1,45 @@
+桌面美化分区 / Desktop Layout Organizer
+
+Based on DayuanJiang/PecoFence v0.4.0, commit 76fe196569b7e4f7c837f315e65fbf1470a68790.
+https://github.com/DayuanJiang/PecoFence/tree/76fe196569b7e4f7c837f315e65fbf1470a68790
+
+This independent distribution adds D-drive migration and login startup, Everything integration,
+screenshot annotation and pinning, Chinese sorting rules and consistent local configuration.
+The public edition uses an original icon (desktop-layout.ico) and its own release and issue pages.
+
+Changed upstream files (under 工程/native in the source; each carries a modification notice):
+  crates/app/build.rs
+  crates/app/src/app/dnd.rs
+  crates/app/src/app/feedback.rs
+  crates/app/src/app/items.rs
+  crates/app/src/app/menus.rs
+  crates/app/src/app/mod.rs
+  crates/app/src/app/motion.rs
+  crates/app/src/app/peek.rs
+  crates/app/src/app/search.rs
+  crates/app/src/app/settings.rs
+  crates/app/src/app/sync.rs
+  crates/app/src/app/updates.rs
+  crates/app/src/app/usage.rs
+  crates/app/src/app/visuals.rs
+  crates/app/src/double_ctrl.rs
+  crates/app/src/icons.rs
+  crates/app/src/main.rs
+  crates/app/src/peek.rs
+  crates/app/src/peek_search.rs
+  crates/app/src/settings_host.rs
+  crates/app/src/state.rs
+  crates/core/src/brand.rs
+  crates/core/src/config_store.rs
+  crates/core/src/model.rs
+  crates/platform/src/autostart.rs
+  crates/platform/src/dialogs.rs
+  crates/platform/src/everything.rs
+  crates/watchdog/Cargo.toml
+  rust-toolchain.toml
+  scripts/cli-smoke.ps1
+  ui/settings.html
+
+Third-party components, notices and licenses: see the adjacent files and 工程/native/third_party.
+Everything and the WebView2 Runtime bootstrapper are obtained from their vendors as needed.
+The redistributed WebView2Loader.dll is covered by the Microsoft notice in WebView2.txt.

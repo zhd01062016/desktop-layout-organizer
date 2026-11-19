@@ -1,0 +1,220 @@
+// Modified for Desktop Layout Organizer from upstream PecoFence v0.4.0.
+//! Per-user immediate logon tasks, migrating legacy Run entries.
+
+use crate::bindings::*;
+use crate::wide::{from_wide, to_wide};
+use windows_core::{Error, PCWSTR, PWSTR, Result};
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+
+/// Explicit settings changes address both names, avoiding duplicate login launches.
+/// Store (MSIX) installs leave the registry alone: the package startup task owns autostart.
+/// A portable copy's entry starts it with `--portable`, so it opens its own configuration.
+pub fn set_product_enabled(enabled: bool, portable: bool) -> Result<()> {
+    use pecofence_core::brand::{LEGACY_AUTOSTART, NAME};
+    if crate::process::is_packaged() {
+        return Ok(());
+    }
+    // Verify registration before removing the working legacy Run entry.
+    logon_task(if enabled { "Enable" } else { "Disable" }, portable)?;
+    set_enabled(NAME, false, false)?;
+    if registered_path(LEGACY_AUTOSTART).is_some() {
+        set_enabled(LEGACY_AUTOSTART, false, false)?;
+    }
+    Ok(())
+}
+
+/// Task values travel through the environment, never interpolated into script text.
+fn logon_task(mode: &str, portable: bool) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let started = std::time::Instant::now();
+    let powershell = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+    )
+    .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let output = std::process::Command::new(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            include_str!("logon-task.ps1"),
+        ])
+        .env("PECOFENCE_TASK_MODE", mode)
+        .env("PECOFENCE_TASK_EXE", exe_path())
+        .env(
+            "PECOFENCE_TASK_ARGS",
+            if portable { "--portable" } else { "" },
+        )
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|error| {
+            Error::new(
+                windows_core::HRESULT(0x8000_4005u32 as i32),
+                error.to_string(),
+            )
+        })?;
+    tracing::info!(
+        ms = started.elapsed().as_millis() as u64,
+        "login task operation"
+    );
+    if !output.status.success() {
+        return Err(Error::new(
+            windows_core::HRESULT(0x8000_4005u32 as i32),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Full path of the running executable.
+pub fn exe_path() -> String {
+    let mut buf = [0u16; 1024];
+    // SAFETY: buffer length passed.
+    let n = unsafe { GetModuleFileNameW(None, PWSTR(buf.as_mut_ptr()), buf.len() as u32) };
+    from_wide(&buf[..n as usize])
+}
+
+fn open_run_key() -> Result<HKEY> {
+    let key = to_wide(RUN_KEY);
+    let mut hkey = HKEY::default();
+    // SAFETY: out-pointer to a local; the key is closed by the caller.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            None,
+            PCWSTR::null(),
+            0,
+            ACCESS_MASK((KEY_SET_VALUE | KEY_QUERY_VALUE) as u32),
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if status.0 != 0 {
+        return Err(win32_error(status.0 as u32));
+    }
+    Ok(hkey)
+}
+
+pub fn set_enabled(value_name: &str, enabled: bool, portable: bool) -> Result<()> {
+    let hkey = open_run_key()?;
+    let name = to_wide(value_name);
+    // SAFETY: buffers outlive the calls; key closed afterwards.
+    let status = unsafe {
+        let s = if enabled {
+            let args = if portable { " --portable" } else { "" };
+            let cmd = to_wide(&format!("\"{}\"{args}", exe_path()));
+            let bytes: Vec<u8> = cmd.iter().flat_map(|c| c.to_le_bytes()).collect();
+            RegSetValueExW(hkey, PCWSTR(name.as_ptr()), None, REG_SZ, Some(&bytes))
+        } else {
+            let s = RegDeleteValueW(hkey, PCWSTR(name.as_ptr()));
+            // ERROR_FILE_NOT_FOUND is fine when already disabled.
+            if s.0 == 2 { LSTATUS(0) } else { s }
+        };
+        let _ = RegCloseKey(hkey);
+        s
+    };
+    if status.0 != 0 {
+        return Err(win32_error(status.0 as u32));
+    }
+    Ok(())
+}
+
+/// Writes `command` as this user's Run value `value_name`, or removes the value (`None`; gone
+/// already is fine). For other programs' entries (Everything 1.5 for 改用 1.5).
+pub fn set_command(value_name: &str, command: Option<&str>) -> Result<()> {
+    let hkey = open_run_key()?;
+    let name = to_wide(value_name);
+    // SAFETY: buffers outlive the calls; key closed afterwards.
+    let status = unsafe {
+        let s = match command {
+            Some(command) => {
+                let cmd = to_wide(command);
+                let bytes: Vec<u8> = cmd.iter().flat_map(|c| c.to_le_bytes()).collect();
+                RegSetValueExW(hkey, PCWSTR(name.as_ptr()), None, REG_SZ, Some(&bytes))
+            }
+            None => {
+                let s = RegDeleteValueW(hkey, PCWSTR(name.as_ptr()));
+                if s.0 == 2 { LSTATUS(0) } else { s }
+            }
+        };
+        let _ = RegCloseKey(hkey);
+        s
+    };
+    if status.0 != 0 {
+        return Err(win32_error(status.0 as u32));
+    }
+    Ok(())
+}
+
+/// The executable path currently registered for `value_name` (quotes stripped), if any.
+pub fn registered_path(value_name: &str) -> Option<String> {
+    registered_command(value_name).map(|command| command_path(&command).to_string())
+}
+
+/// The command line registered for `value_name`, if any.
+fn registered_command(value_name: &str) -> Option<String> {
+    let key = to_wide(RUN_KEY);
+    let name = to_wide(value_name);
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: out-pointers reference locals with the declared sizes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status.0 != 0 {
+        return None;
+    }
+    let chars = (size as usize / 2).min(buf.len());
+    let raw = from_wide(&buf[..chars]);
+    Some(raw.trim_end_matches('\0').trim().to_string())
+}
+
+/// The program of a Run entry's command line: the quoted part, or the whole line unquoted.
+fn command_path(command: &str) -> &str {
+    match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => command,
+    }
+}
+
+pub fn is_enabled(value_name: &str) -> bool {
+    let key = to_wide(RUN_KEY);
+    let name = to_wide(value_name);
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: out-pointers reference locals with the declared sizes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    status.0 == 0 && !from_wide(&buf).is_empty()
+}
+
+fn win32_error(code: u32) -> Error {
+    // HRESULT_FROM_WIN32
+    let hr = if code == 0 {
+        0
+    } else {
+        (code & 0xffff) | 0x8007_0000
+    };
+    Error::from_hresult(windows_core::HRESULT(hr as i32))
+}

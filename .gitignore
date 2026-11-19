@@ -1,0 +1,13 @@
+.build/
+target/
+.cache/
+node_modules/
+.vs/
+Thumbs.db
+Desktop.ini
+*.pdb
+*.log
+*.zip
+*.bak
+.env
+.env.*

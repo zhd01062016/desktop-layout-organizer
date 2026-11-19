@@ -1,0 +1,670 @@
+{
+    "$schema":  "https://pecofence.jiang.jp/schema/config.json",
+    "schemaVersion":  1,
+    "savedBy":  "0.4.0",
+    "settings":  {
+                     "language":  "system",
+                     "backdrop":  "acrylic",
+                     "theme":  "followWindowsMode",
+                     "themeStyle":  "fluent",
+                     "customTheme":  null,
+                     "labelColor":  "auto",
+                     "titleAlign":  "left",
+                     "tabBar":  "top",
+                     "iconSize":  48,
+                     "quickHide":  {
+                                       "enabled":  false,
+                                       "scope":  "all",
+                                       "alwaysShowAtStartup":  true,
+                                       "delayMs":  300,
+                                       "autoHideIdleSec":  0,
+                                       "autoShowOnUse":  true,
+                                       "wallpaperEngineClassWhitelist":  [
+
+                                                                         ]
+                                   },
+                     "rollUp":  {
+                                    "doubleClickTitle":  true,
+                                    "autoOnScreenEdge":  true,
+                                    "hoverPeek":  true,
+                                    "hoverOpenMs":  400,
+                                    "closeGraceMs":  400,
+                                    "clickToExpand":  false,
+                                    "hoverSpeed":  "normal",
+                                    "titleOnHover":  false,
+                                    "hideInactiveScrollbar":  false,
+                                    "pushNeighbors":  true,
+                                    "switchTabOnHover":  true,
+                                    "hideCountAndChevron":  false
+                                },
+                     "showDesktop":  "keepVisible",
+                     "hideRealIcons":  true,"minimalDesktopIcons":true,
+                     "keepIconsHidden":  false,
+                     "hideInboxWhenIconsShown":  false,
+                     "offerNewFence":  true,
+                     "perDesktopFences":  false,
+                     "featureTips":  true,
+                     "autoCheckUpdates":  false,
+                     "showTrayIcon":  true,
+                     "usageStats":  false,
+                     "showRealIconsWhenFencesHidden":  false,
+                     "snapping":  {
+                                      "enabled":  true,
+                                      "gapPx":  8,
+                                      "sizeToCells":  false,
+                                      "guideLines":  true
+                                  },
+                     "zorder":  "insertAboveHost",
+                     "autostart":  true,
+                     "telemetry":  false,
+                     "peek":  {
+                                  "enabled":  true,
+                                  "dim":  true,
+                                  "hotkey":  "ctrlAltSpace",
+                                  "customHotkey":  "Alt+Q",
+                                  "doubleCtrl":  false
+                              },
+                     "windowsDesktopHotkey":  null,
+                     "icons":  {
+                                   "tintRgb":  null,
+                                   "tintStrength":  0.6,
+                                   "chameleon":  false,
+                                   "shortcutArrows":  true
+                               },
+                     "desktopPath":  null,
+                     "tools":  {
+                                   "enabled":  true,
+                                   "clockSeconds":  false,
+                                   "dialogJump":  false,
+                                   "everything":  true
+                               }
+                 },
+    "items":  {
+
+              },
+    "layouts":  [
+                    {
+                        "fingerprint":  [
+                                            {
+                                                "devicePath":  "DISPLAY1",
+                                                "gdiName":  "\\\\.\\DISPLAY1",
+                                                "workDip":  [
+                                                                2048.0,
+                                                                1104.0
+                                                            ],
+                                                "dpi":  120,
+                                                "screenPx":  [
+                                                                 2560,
+                                                                 1440
+                                                             ]
+                                            }
+                                        ],
+                        "fences":  [
+                                       {
+                                           "id":  "4d2bb303-693e-425c-9773-c21cd02b8d65",
+                                           "title":  "应用快捷方式",
+                                           "kind":  "virtual",
+                                           "source":  {
+                                                          "kind":  "desktop"
+                                                      },
+                                           "geometry":  {
+                                                            "monitor":  "DISPLAY1",
+                                                            "x":  800.0,
+                                                            "y":  38.4,
+                                                            "w":  392.0,
+                                                            "h":  304.0,
+                                                            "workW":  2048.0,
+                                                            "workH":  1104.0,
+                                                            "anchor":  "hCenterTop"
+                                                        },
+                                           "rolledUp":  false,
+                                           "expandedH":  304.0,
+                                           "view":  {
+                                                        "iconSize":  32,
+                                                        "sort":  "name",
+                                                        "labelLines":  2,
+                                                        "autoHeight":  false,
+                                                        "reverse":  false,
+                                                        "layout":  "icons",
+                                                        "spacing":  "normal",
+                                                        "columnWidths":  null,
+                                                        "columnsVisible":  null,
+                                                        "groupByDate":  false,
+                                                        "foldersFirst":  false,
+                                                        "iconAlign":  "left"
+                                                    },
+                                           "appearance":  {
+                                                              "tintRgb":  [
+                                                                              79,
+                                                                              130,
+                                                                              187
+                                                                          ],
+                                                              "opacity":  null,
+                                                              "backdrop":  null,
+                                                              "titleRgb":  null,
+                                                              "titleSize":  null,
+                                                              "titleOnHover":  null,
+                                                              "tintTitleOnly":  true,
+                                                              "tabRgb":  null,
+                                                              "transparentOnHover":  false
+                                                          },
+                                           "excludeFromQuickHide":  false,
+                                           "locked":  false,
+                                           "tabHost":  null,
+                                           "activeTab":  null,
+                                           "tabOrder":  [
+
+                                                        ],
+                                           "portalNavigate":  true,
+                                           "openFoldersInside":  false,
+                                           "hideTitleIcon":  false,
+                                           "hideWhenEmpty":  false,
+                                           "expandUpward":  false,
+                                           "bottomAnchored":  false,
+                                           "desktopLayout":  false,
+                                           "freePlacement":  false,
+                                           "items":  [
+
+                                                     ]
+                                       },
+                                       {
+                                           "id":  "204e6a5a-da02-4319-a913-eb4dbaaca1e1",
+                                           "title":  "文件夹",
+                                           "kind":  "folderPortal",
+                                           "source":  {
+                                                          "filter":  null,
+                                                          "path":  "文件夹",
+                                                          "recursive":  false,
+                                                          "kind":  "folder"
+                                                      },
+                                           "geometry":  {
+                                                            "monitor":  "DISPLAY1",
+                                                            "x":  1208.0,
+                                                            "y":  38.4,
+                                                            "w":  392.0,
+                                                            "h":  144.0,
+                                                            "workW":  2048.0,
+                                                            "workH":  1104.0,
+                                                            "anchor":  "rightTop"
+                                                        },
+                                           "rolledUp":  false,
+                                           "expandedH":  144.0,
+                                           "view":  {
+                                                        "iconSize":  32,
+                                                        "sort":  "name",
+                                                        "labelLines":  2,
+                                                        "autoHeight":  false,
+                                                        "reverse":  false,
+                                                        "layout":  "icons",
+                                                        "spacing":  "normal",
+                                                        "columnWidths":  null,
+                                                        "columnsVisible":  null,
+                                                        "groupByDate":  false,
+                                                        "foldersFirst":  false,
+                                                        "iconAlign":  "left"
+                                                    },
+                                           "appearance":  {
+                                                              "tintRgb":  [
+                                                                              71,
+                                                                              140,
+                                                                              121
+                                                                          ],
+                                                              "opacity":  null,
+                                                              "backdrop":  null,
+                                                              "titleRgb":  null,
+                                                              "titleSize":  null,
+                                                              "titleOnHover":  null,
+                                                              "tintTitleOnly":  true,
+                                                              "tabRgb":  null,
+                                                              "transparentOnHover":  false
+                                                          },
+                                           "excludeFromQuickHide":  false,
+                                           "locked":  false,
+                                           "tabHost":  null,
+                                           "activeTab":  null,
+                                           "tabOrder":  [
+
+                                                        ],
+                                           "portalNavigate":  true,
+                                           "openFoldersInside":  false,
+                                           "hideTitleIcon":  false,
+                                           "hideWhenEmpty":  false,
+                                           "expandUpward":  false,
+                                           "bottomAnchored":  false,
+                                           "desktopLayout":  false,
+                                           "freePlacement":  false,
+                                           "items":  [
+
+                                                     ]
+                                       },
+                                       {
+                                           "id":  "2a39796b-700d-40de-92ef-6a126de4ee46",
+                                           "title":  "办公文档",
+                                           "kind":  "folderPortal",
+                                           "source":  {
+                                                          "filter":  null,
+                                                          "path":  "办公文档",
+                                                          "recursive":  false,
+                                                          "kind":  "folder"
+                                                      },
+                                           "geometry":  {
+                                                            "monitor":  "DISPLAY1",
+                                                            "x":  1616.0,
+                                                            "y":  38.4,
+                                                            "w":  392.0,
+                                                            "h":  144.0,
+                                                            "workW":  2048.0,
+                                                            "workH":  1104.0,
+                                                            "anchor":  "rightTop"
+                                                        },
+                                           "rolledUp":  false,
+                                           "expandedH":  144.0,
+                                           "view":  {
+                                                        "iconSize":  32,
+                                                        "sort":  "name",
+                                                        "labelLines":  2,
+                                                        "autoHeight":  false,
+                                                        "reverse":  false,
+                                                        "layout":  "icons",
+                                                        "spacing":  "normal",
+                                                        "columnWidths":  null,
+                                                        "columnsVisible":  null,
+                                                        "groupByDate":  false,
+                                                        "foldersFirst":  false,
+                                                        "iconAlign":  "left"
+                                                    },
+                                           "appearance":  {
+                                                              "tintRgb":  [
+                                                                              129,
+                                                                              104,
+                                                                              168
+                                                                          ],
+                                                              "opacity":  null,
+                                                              "backdrop":  null,
+                                                              "titleRgb":  null,
+                                                              "titleSize":  null,
+                                                              "titleOnHover":  null,
+                                                              "tintTitleOnly":  true,
+                                                              "tabRgb":  null,
+                                                              "transparentOnHover":  false
+                                                          },
+                                           "excludeFromQuickHide":  false,
+                                           "locked":  false,
+                                           "tabHost":  null,
+                                           "activeTab":  null,
+                                           "tabOrder":  [
+
+                                                        ],
+                                           "portalNavigate":  true,
+                                           "openFoldersInside":  false,
+                                           "hideTitleIcon":  false,
+                                           "hideWhenEmpty":  false,
+                                           "expandUpward":  false,
+                                           "bottomAnchored":  false,
+                                           "desktopLayout":  false,
+                                           "freePlacement":  false,
+                                           "items":  [
+
+                                                     ]
+                                       },
+                                       {
+                                           "id":  "fd51de70-1f7a-4e24-8c08-77067020bfce",
+                                           "title":  "桌面",
+                                           "kind":  "inbox",
+                                           "source":  {
+                                                          "kind":  "desktop"
+                                                      },
+                                           "geometry":  {
+                                                            "monitor":  "DISPLAY1",
+                                                            "x":  1800.0,
+                                                            "y":  712.0,
+                                                            "w":  240.0,
+                                                            "h":  384.0,
+                                                            "workW":  2048.0,
+                                                            "workH":  1104.0,
+                                                            "anchor":  "rightBottom"
+                                                        },
+                                           "rolledUp":  false,
+                                           "expandedH":  384.0,
+                                           "view":  {
+                                                        "iconSize":  48,
+                                                        "sort":  "manual",
+                                                        "labelLines":  2,
+                                                        "autoHeight":  false,
+                                                        "reverse":  false,
+                                                        "layout":  "icons",
+                                                        "spacing":  "normal",
+                                                        "columnWidths":  null,
+                                                        "columnsVisible":  null,
+                                                        "groupByDate":  false,
+                                                        "foldersFirst":  false,
+                                                        "iconAlign":  "left"
+                                                    },
+                                           "appearance":  null,
+                                           "excludeFromQuickHide":  false,
+                                           "locked":  false,
+                                           "tabHost":  null,
+                                           "activeTab":  null,
+                                           "tabOrder":  [
+
+                                                        ],
+                                           "portalNavigate":  true,
+                                           "openFoldersInside":  false,
+                                           "hideTitleIcon":  false,
+                                           "hideWhenEmpty":  false,
+                                           "expandUpward":  false,
+                                           "bottomAnchored":  false,
+                                           "desktopLayout":  true,
+                                           "freePlacement":  true,
+                                           "items":  [
+
+                                                     ]
+                                       },
+                                       {
+                                           "id":  "11f0d551-dfb0-43b1-803a-e9be58f34475",
+                                           "title":  "工程图档",
+                                           "kind":  "folderPortal",
+                                           "source":  {
+                                                          "filter":  null,
+                                                          "path":  "工程图档",
+                                                          "recursive":  false,
+                                                          "kind":  "folder"
+                                                      },
+                                           "geometry":  {
+                                                            "monitor":  "DISPLAY1",
+                                                            "x":  1208.0,
+                                                            "y":  198.4,
+                                                            "w":  392.0,
+                                                            "h":  144.0,
+                                                            "workW":  2048.0,
+                                                            "workH":  1104.0,
+                                                            "anchor":  "rightTop"
+                                                        },
+                                           "rolledUp":  false,
+                                           "expandedH":  144.0,
+                                           "view":  {
+                                                        "iconSize":  32,
+                                                        "sort":  "name",
+                                                        "labelLines":  2,
+                                                        "autoHeight":  false,
+                                                        "reverse":  false,
+                                                        "layout":  "list",
+                                                        "spacing":  "normal",
+                                                        "columnWidths":  null,
+                                                        "columnsVisible":  null,
+                                                        "groupByDate":  false,
+                                                        "foldersFirst":  false,
+                                                        "iconAlign":  "left"
+                                                    },
+                                           "appearance":  {
+                                                              "tintRgb":  [
+                                                                              175,
+                                                                              122,
+                                                                              64
+                                                                          ],
+                                                              "opacity":  null,
+                                                              "backdrop":  null,
+                                                              "titleRgb":  null,
+                                                              "titleSize":  null,
+                                                              "titleOnHover":  null,
+                                                              "tintTitleOnly":  true,
+                                                              "tabRgb":  null,
+                                                              "transparentOnHover":  false
+                                                          },
+                                           "excludeFromQuickHide":  false,
+                                           "locked":  false,
+                                           "tabHost":  null,
+                                           "activeTab":  null,
+                                           "tabOrder":  [
+
+                                                        ],
+                                           "portalNavigate":  true,
+                                           "openFoldersInside":  false,
+                                           "hideTitleIcon":  false,
+                                           "hideWhenEmpty":  false,
+                                           "expandUpward":  false,
+                                           "bottomAnchored":  false,
+                                           "desktopLayout":  false,
+                                           "freePlacement":  false,
+                                           "items":  [
+
+                                                     ]
+                                       },
+                                       {
+                                           "id":  "4d3bf9d5-8b88-4ab0-97ea-351f253b786c",
+                                           "title":  "图片与其他",
+                                           "kind":  "folderPortal",
+                                           "source":  {
+                                                          "filter":  null,
+                                                          "path":  "图片与其他",
+                                                          "recursive":  false,
+                                                          "kind":  "folder"
+                                                      },
+                                           "geometry":  {
+                                                            "monitor":  "DISPLAY1",
+                                                            "x":  1616.0,
+                                                            "y":  198.4,
+                                                            "w":  392.0,
+                                                            "h":  144.0,
+                                                            "workW":  2048.0,
+                                                            "workH":  1104.0,
+                                                            "anchor":  "rightTop"
+                                                        },
+                                           "rolledUp":  false,
+                                           "expandedH":  144.0,
+                                           "view":  {
+                                                        "iconSize":  32,
+                                                        "sort":  "name",
+                                                        "labelLines":  2,
+                                                        "autoHeight":  false,
+                                                        "reverse":  false,
+                                                        "layout":  "list",
+                                                        "spacing":  "normal",
+                                                        "columnWidths":  null,
+                                                        "columnsVisible":  null,
+                                                        "groupByDate":  false,
+                                                        "foldersFirst":  false,
+                                                        "iconAlign":  "left"
+                                                    },
+                                           "appearance":  {
+                                                              "tintRgb":  [
+                                                                              171,
+                                                                              99,
+                                                                              123
+                                                                          ],
+                                                              "opacity":  null,
+                                                              "backdrop":  null,
+                                                              "titleRgb":  null,
+                                                              "titleSize":  null,
+                                                              "titleOnHover":  null,
+                                                              "tintTitleOnly":  true,
+                                                              "tabRgb":  null,
+                                                              "transparentOnHover":  false
+                                                          },
+                                           "excludeFromQuickHide":  false,
+                                           "locked":  false,
+                                           "tabHost":  null,
+                                           "activeTab":  null,
+                                           "tabOrder":  [
+
+                                                        ],
+                                           "portalNavigate":  true,
+                                           "openFoldersInside":  false,
+                                           "hideTitleIcon":  false,
+                                           "hideWhenEmpty":  false,
+                                           "expandUpward":  false,
+                                           "bottomAnchored":  false,
+                                           "desktopLayout":  false,
+                                           "freePlacement":  false,
+                                           "items":  [
+
+                                                     ]
+                                       }
+                                   ],
+                        "shown":  1
+                    }
+                ],
+    "rules":  {
+                  "defaultTarget":  "inbox",
+                  "keepUpdated":  true,
+                  "list":  [
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "type",
+                                                     "value":  [
+                                                                   "programs",
+                                                                   "shortcuts"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  true,
+                                   "id":  "99cf1fda-5ba6-42f5-aff8-762193a2c17b",
+                                   "name":  "程序与快捷方式",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "4d2bb303-693e-425c-9773-c21cd02b8d65"
+                                              }
+                               },
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "type",
+                                                     "value":  [
+                                                                   "folders"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  true,
+                                   "id":  "f4ca1587-aec0-446a-83ab-75ca35432b94",
+                                   "name":  "文件夹",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "204e6a5a-da02-4319-a913-eb4dbaaca1e1"
+                                              }
+                               },
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "type",
+                                                     "value":  [
+                                                                   "documents",
+                                                                   "images",
+                                                                   "music",
+                                                                   "video",
+                                                                   "archives"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  false,
+                                   "id":  "57218e34-ca2b-461b-9738-440c032ac566",
+                                   "name":  "文件与文档",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "2a39796b-700d-40de-92ef-6a126de4ee46"
+                                              }
+                               },
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "ext",
+                                                     "value":  [
+                                                                   ".pdf",
+                                                                   ".doc",
+                                                                   ".docx",
+                                                                   ".xls",
+                                                                   ".xlsx",
+                                                                   ".xlsm",
+                                                                   ".ppt",
+                                                                   ".pptx",
+                                                                   ".csv",
+                                                                   ".txt",
+                                                                   ".rtf",
+                                                                   ".odt",
+                                                                   ".ods",
+                                                                   ".odp"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  true,
+                                   "id":  "f410f85b-050f-4dd1-bf42-0889178b55e9",
+                                   "name":  "办公文档",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "2a39796b-700d-40de-92ef-6a126de4ee46"
+                                              }
+                               },
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "ext",
+                                                     "value":  [
+                                                                   ".stp",
+                                                                   ".step",
+                                                                   ".prt",
+                                                                   ".asm",
+                                                                   ".drw",
+                                                                   ".dwg",
+                                                                   ".dxf",
+                                                                   ".igs",
+                                                                   ".iges",
+                                                                   ".stl",
+                                                                   ".sldprt",
+                                                                   ".sldasm",
+                                                                   ".slddrw"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  true,
+                                   "id":  "d2500276-b7fe-4421-8145-4c7d40e08233",
+                                   "name":  "工程图档",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "11f0d551-dfb0-43b1-803a-e9be58f34475"
+                                              }
+                               },
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "type",
+                                                     "value":  [
+                                                                   "images",
+                                                                   "archives"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  true,
+                                   "id":  "3b0dc4db-b025-4655-bd30-03367f92b3a8",
+                                   "name":  "图片和压缩包",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "4d3bf9d5-8b88-4ab0-97ea-351f253b786c"
+                                              }
+                               },
+                               {
+                                   "allOf":  [
+                                                 {
+                                                     "cond":  "type",
+                                                     "value":  [
+                                                                   "documents"
+                                                               ]
+                                                 }
+                                             ],
+                                   "enabled":  true,
+                                   "id":  "13ee8511-1098-42a9-89e0-1b960751f9e6",
+                                   "name":  "其他常见文档",
+                                   "priorityClass":  "type",
+                                   "target":  {
+                                                  "fence":  "2a39796b-700d-40de-92ef-6a126de4ee46"
+                                              }
+                               }
+                           ],
+                  "unmatched":  "defaultTarget"
+              },
+    "undoLog":  [
+
+                ],
+    "snapshots":  [
+
+                  ]
+}
