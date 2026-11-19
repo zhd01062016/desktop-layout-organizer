@@ -4,6 +4,9 @@ $inputs = Join-Path $PSScriptRoot package
 if (!(Test-Path $inputs)) { $inputs=Split-Path $PSScriptRoot }
 $native = Join-Path $PSScriptRoot 'native\target\release'
 $managed = Join-Path $PSScriptRoot '.build\managed'
+if ((Get-Item -LiteralPath "$native\pecofence.exe").VersionInfo.ProductName -ne '桌面美化分区') {
+    throw '主程序缺少公开版的名称和图标资源。请安装 Windows SDK 后重新构建。'
+}
 $build = Join-Path $OutputRoot ([Guid]::NewGuid().ToString('N'))
 $stage = Join-Path $build '迁移包'
 $payload = Join-Path $stage PecoFenceNative

@@ -39,14 +39,17 @@ fn main() {
     };
 
     let rc_path = out_dir.join("pecofence.rc");
-    std::fs::write(&rc_path, rc_source(&ico)).expect("write .rc");
+    let icon_name = Path::new("desktop-layout.ico");
+    std::fs::copy(&ico, out_dir.join(icon_name)).expect("copy icon for resource compiler");
+    std::fs::write(&rc_path, rc_source(icon_name)).expect("write .rc");
     let res_path = out_dir.join("pecofence.res");
     // /nologo, /fo output; no /i needed because the script includes no headers.
     let status = Command::new(&rc)
+        .current_dir(&out_dir)
         .arg("/nologo")
         .arg("/fo")
-        .arg(&res_path)
-        .arg(&rc_path)
+        .arg("pecofence.res")
+        .arg("pecofence.rc")
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -118,7 +121,7 @@ fn rc_source(ico: &Path) -> String {
     // notifications, Task Manager's process list, Settings > Apps > Startup. The app is
     // "PecoFence" there; the watchdog keeps its sentence, which tells the two processes apart.
     let description = if name == "pecofence" {
-        "Desktop Layout Organizer".to_string()
+        "桌面美化分区".to_string()
     } else if description.is_empty() {
         name.clone()
     } else {
@@ -128,7 +131,8 @@ fn rc_source(ico: &Path) -> String {
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\"\"");
     let ico = esc(ico.display().to_string().trim_start_matches(r"\\?\"));
     format!(
-        r#"1 ICON "{ico}"
+        r#"#pragma code_page(65001)
+1 ICON "{ico}"
 
 1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},0
@@ -146,7 +150,7 @@ BEGIN
       VALUE "InternalName", "{name}"
       VALUE "LegalCopyright", "Copyright (c) Dayuan Jiang. Licensed under the Apache License 2.0."
       VALUE "OriginalFilename", "{name}.exe"
-      VALUE "ProductName", "Desktop Layout Organizer"
+      VALUE "ProductName", "桌面美化分区"
       VALUE "ProductVersion", "{version}"
     END
   END
